@@ -159,6 +159,8 @@ npm start                  # 前台运行
 
 看到日志里 `SnowLuma 已连接` 即成功。
 
+> DSH 桌面版每次启动端口都会变。想让桥接自动跟随，双击 **`watch-dsh.bat`**：它常驻后台，发现端口变了就改写 `config.json` 的 `dsh.baseUrl` 并让桥接重启（日志在 `state/watch.log`）。
+
 ### 7. 打开控制台
 
 <http://127.0.0.1:3100> —— 令牌在 `state/console-token`。在控制台里：
@@ -180,7 +182,7 @@ npm start                  # 前台运行
 | `listen EACCES ... 3000/3001` | Windows 动态端口保留段占用 → 改用 `38000/38001` |
 | 控制台 401 / 打不开 | 地址是 `http://127.0.0.1:3100`，令牌在 `state/console-token` |
 | MCP 工具报 `HTTP 426` | `httpUrl` 填成了 WS 端口；HTTP API 和 WS 是**两个**端口 |
-| DSH 重启后桥接找不到它 | DSH 端口每次启动随机；重跑 `node scripts/dsh-endpoint.mjs`，或重启桥接让它自动探测 |
+| DSH 重启后桥接找不到它 | DSH 端口每次启动随机；双击 `watch-dsh.bat` 让它常驻自动跟随，或重跑 `node scripts/dsh-endpoint.mjs`，或重启桥接让它自动探测 |
 | AI 明明回复了但 QQ 没收到 | `socialV2` 模式下文本不自动转发，必须由 AI 调发送工具；preset 里已写了规则，检查一下是不是切到了错的模式 |
 
 ## 配置要点（本仓库新增的字段）
