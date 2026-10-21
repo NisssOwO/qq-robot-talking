@@ -17,6 +17,25 @@ commit 2+ custom: ...                      ← 全部改动
 
 ---
 
+## 开始之前：你需要先准备好这些
+
+这个项目不是「下载下来双击就能跑」的单文件程序——它挂在两个外部软件上，**下面 4 项缺任何一项都跑不起来**：
+
+| # | 要先准备 | 它负责什么 | 从哪儿弄 |
+| --- | --- | --- | --- |
+| 1 | **DeepSeek Harness（DSH）** | 机器人的「脑子」。桥接把 QQ 消息转成 DSH 会话里的用户消息，再把 agent 的回复发回 QQ。装好后能打开它的 Web GUI 就行 | 按 DSH 官方说明安装（桌面版或 Web 版都可以） |
+| 2 | **SnowLuma**（QQ 网关） | 真正登录 QQ、收发消息，对外提供 OneBot v11 的 **WebSocket + HTTP API** 两个接口。**这个要你自己下载** | [Releases](https://github.com/SnowLuma/SnowLuma/releases/latest) 下 `SnowLuma-v<版本>-win-x64.zip`（完整版自带 Node 运行时；Lite 版需要本机 Node 22.13+），解压后双击 `launcher.bat` |
+| 3 | **Node.js ≥ 22.13** | 跑桥接本身 | [nodejs.org](https://nodejs.org/) |
+| 4 | **一个 QQ 账号**（建议小号）+ 你自己的 QQ 号 | 小号给机器人登录用；你自己的号填进 `ownerQQ`（静默时段例外、语音试听默认目标、错误通知都发给它） | — |
+
+可选项：
+
+- **Fish Audio API Key** —— 只有要发语音才需要；在控制台「语音」卡里填，不用写进配置文件。不填只影响语音，文字聊天照常。
+- **本地 HTTP 代理** —— TTS 要连 `api.fish.audio`，国内直连可能被重置；有代理就填 `tts.proxy`（例如 `http://127.0.0.1:7897`）。
+- **Windows 动态端口** —— 如果 SnowLuma 报 `listen EACCES: permission denied 127.0.0.1:3000`，把 OneBot 的 HTTP/WS 改到 `38000/38001`（见「常见问题」）。
+
+> 第一次做，建议先照 **[原项目作者的视频教程](https://www.bilibili.com/video/BV1ss8R6zERG/)** 把「DSH + SnowLuma + 原版桥接」连通，再回来用这个定制版——安装前几步和原版完全一致。
+
 ## 这个版本多了什么
 
 | 能力 | 一句话 |
@@ -40,6 +59,7 @@ commit 2+ custom: ...                      ← 全部改动
   - 控制台、token 用量统计、安全边界（工具隐藏清单、语音库路径限制、白名单）
   - 基线版本 `v0.2.0-r4`，适配 DSH `0.2.0-rc.2`
   - 上游完整文档保留在 **[docs/UPSTREAM-README.md](docs/UPSTREAM-README.md)**（含 SnowLuma 版本要求、"连上了但收不到消息"排查、HTTP/WS token 区别等踩坑记录）
+  - 视频教程：<https://www.bilibili.com/video/BV1ss8R6zERG/>（B 站，原作者的完整安装演示，从装 SnowLuma 到跑通第一条消息）
 
 ### 参考项目
 
@@ -77,46 +97,91 @@ QQ ──► SnowLuma（OneBot v11）
 2. **social**：群聊社交模式，桥接自己决定要不要回。
 3. **socialV2（`reserved2`，二代仿真）**：AI 自己决定何时回、回几条、要不要潜水。文本输出**不会自动转发**，必须由 AI 调 `qq_send_message` / `qq_send_burst` / `qq_reply` 等工具发出去 —— 这也是"她说了话但 QQ 没收到"的常见原因。
 
-## 前置条件
+## 视频教程
 
-1. 运行中的 **DeepSeek Harness** Web（端口每次启动会变，桥接会自动发现）
-2. 运行中的 **SnowLuma**，配好 OneBot WebSocket + HTTP API
-3. **Node.js ≥ 22.13**
-4. （可选）**Fish Audio** API Key —— 只有要发语音时需要
-5. （可选）本地 HTTP 代理 —— 只有 TTS 需要翻墙时才配 `tts.proxy`
+原项目（qq-bridge）作者录的完整安装演示：
 
-## 快速开始
+- **B 站**：<https://www.bilibili.com/video/BV1ss8R6zERG/>
+
+视频覆盖的是**原版** qq-bridge 的流程：装 SnowLuma → 扫码登录 → 配 OneBot → 装 DSH 端 preset → 跑通第一条消息。本定制版把这些步骤原样保留，只是多了静默时段 / 语音 / 角色包这些可选能力；按视频走完，再回来看下面「配置要点」即可。
+
+## 上手步骤（按顺序做）
+
+### 1. 确认 DSH 已经装好并正在运行
+
+打开 DSH 的 Web GUI（端口每次启动会变，以实际为准）。**DSH 要先启动，桥接才能找到它**；桥接启动时用 `scripts/dsh-endpoint.mjs` 自动探测端口。
+
+### 2. 下载本仓库并安装依赖
 
 ```bash
 git clone https://github.com/NisssOwO/qq-robot-talking.git
 cd qq-robot-talking
-npm install                      # postinstall 会修补 @snowluma/sdk 的 ESM 打包问题
-cp config.example.json config.json   # Windows CMD: copy config.example.json config.json
+npm install                                # postinstall 会修补 @snowluma/sdk 的 ESM 打包问题
+cp config.example.json config.json         # Windows CMD: copy config.example.json config.json
 ```
 
-编辑 `config.json`，至少填这三项：
+### 3. 启动 SnowLuma 并配好 OneBot
 
-| 字段 | 说明 |
+- 解压 `SnowLuma-v<版本>-win-x64.zip`，双击 `launcher.bat`
+- 打开启动日志里的 **WebUI 地址**（默认 <http://localhost:5099>），用日志里的初始密码登录
+- 按引导走：同意条款 → 设置密码 → 接入 QQ 进程（**扫码登录机器人账号**）
+- 在 WebUI 里开启 **WebSocket 服务端** 和 **HTTP API**，记下两个端口（默认 WS `3001`、HTTP `3000`）和 accessToken
+
+> **Windows 端口坑**：`3000/3001` 经常落在 Windows 的动态端口保留段里，表现是 `listen EACCES: permission denied 127.0.0.1:3000`。可以先跑 `netsh int ipv4 show excludedportrange protocol=tcp` 确认。绕开办法：SnowLuma 里把 HTTP 改成 `38000`、WS 改成 `38001`，桥接配置同步改。注意有些版本还要先关掉 **WS 默认端口**、单独开一个 WS 服务端，两个别同时占。
+
+### 4. 编辑 `config.json`
+
+至少填这四项：
+
+| 字段 | 填什么 |
 | --- | --- |
-| `ownerQQ` | 你自己的 QQ 号（静默时段例外、试听默认目标、错误通知都用它） |
-| `allow.private` / `allow.groups` | 白名单。**留空且 `allowAllWhenEmpty: false`（默认）时谁都不回** |
-| `snowluma.wsUrl` / `httpUrl` | SnowLuma 的 WS / HTTP 地址 |
+| `ownerQQ` | 你自己的 QQ 号 |
+| `allow.private` / `allow.groups` | 允许机器人回复的 QQ 号 / 群号。**留空时默认谁都不回**（fail-closed，别担心它乱说话） |
+| `snowluma.wsUrl` / `httpUrl` | 例如 `ws://127.0.0.1:38001` / `http://127.0.0.1:38000` |
+| `snowluma.accessToken` | 与 WebUI 里的一致，没设就留空 |
 
-然后装 DSH 端（**必做**，漏了 QQ 上会毫无反应）：
+可选：`consolePort`（默认 3100）、`quietHours`（静默时段）、`socialV2.proactive`（主动搭话）、`tts`（语音）。控制台里也能改。
 
-```bash
-node scripts/setup-dsh.mjs       # 装 preset + 挂 MCP，装完重启 DSH
-```
-
-最后启动：
+### 5. 装 DSH 端（最容易漏，漏了 QQ 上毫无反应）
 
 ```bash
-node src/bridge.js               # 或 Windows 双击 start.bat
+node scripts/setup-dsh.mjs
 ```
 
-打开 `http://127.0.0.1:3100`（令牌在 `state/console-token`）。
+这一步会往 DSH profile 里装 `qq-chat` / `qq-chat-v2` 两个 preset，并挂载 `snowluma` / `snowluma-host` / `web-search-safe` 三个 MCP。**装完必须重启 DSH**——preset 和 MCP 只在 DSH 启动时加载。
 
-> **Windows 注意**：如果 SnowLuma 报 `listen EACCES ... 3000/3001`，是 Windows 动态端口保留段占用了端口（`netsh int ipv4 show excludedportrange protocol=tcp` 可查）。把 SnowLuma 的 OneBot HTTP/WS 改到 `38000/38001`，桥接的 `snowluma.httpUrl/wsUrl` 同步改即可。
+### 6. 启动桥接
+
+```bash
+npm start                  # 前台运行
+# 或 Windows 双击 start.bat（崩溃自动重启）
+```
+
+看到日志里 `SnowLuma 已连接` 即成功。
+
+### 7. 打开控制台
+
+<http://127.0.0.1:3100> —— 令牌在 `state/console-token`。在控制台里：
+
+- **模式**：单会话转发 / `social` / `socialV2`（二代仿真，推荐）。注意 `socialV2` 下 AI 的文本**不会自动转发**，要靠它自己调 `qq_send_message` 等工具发出去
+- **角色**：下拉选人格卡（`roles/*.md`），音色、注音字典、世界观会跟着角色包一起换
+- **语音**：填 Fish Audio Key → 点「测试连通性」→ 点「试听」
+- **静默时段 / 主动搭话**：「运行总览」页里的卡片
+
+### 8. 测试
+
+用你的 QQ 给机器人小号发消息，或在群里 @ 它，应该能收到回复。收不到就看下面「常见问题」。
+
+## 常见问题
+
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| QQ 上完全没反应 | ① 白名单没填（`allow.private` / `allow.groups` 是空数组）② 没跑 `node scripts/setup-dsh.mjs` ③ 跑完没重启 DSH ④ SnowLuma 没连上（看桥接日志有没有 `SnowLuma 已连接`） |
+| `listen EACCES ... 3000/3001` | Windows 动态端口保留段占用 → 改用 `38000/38001` |
+| 控制台 401 / 打不开 | 地址是 `http://127.0.0.1:3100`，令牌在 `state/console-token` |
+| MCP 工具报 `HTTP 426` | `httpUrl` 填成了 WS 端口；HTTP API 和 WS 是**两个**端口 |
+| DSH 重启后桥接找不到它 | DSH 端口每次启动随机；重跑 `node scripts/dsh-endpoint.mjs`，或重启桥接让它自动探测 |
+| AI 明明回复了但 QQ 没收到 | `socialV2` 模式下文本不自动转发，必须由 AI 调发送工具；preset 里已写了规则，检查一下是不是切到了错的模式 |
 
 ## 配置要点（本仓库新增的字段）
 
