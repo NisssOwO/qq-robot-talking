@@ -1,3 +1,5 @@
+> **这是上游 qq-bridge 的 README 原文，保留作参考。** 本仓库的定制说明见根目录 [README.md](../README.md) 与 [CHANGES.md](../CHANGES.md)。文中的相对链接以仓库根目录为基准。
+
 # QQ ↔ DeepSeek Harness Bridge (qq-bridge)
 
 > Connect QQ messages to DeepSeek Harness (DSH) agents: QQ friends/groups become DSH conversations, and agent replies (including questions and tool approvals) are sent back to QQ.
