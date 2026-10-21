@@ -25,6 +25,9 @@ import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
+import { QuietHours } from './quiet-hours.mjs';
+import { buildWorldPrompt } from './world-prompt.mjs';
+import { synthesizeFish, TtsError, saveTtsAudio, measureSeconds, estimateMp3Seconds } from './tts-fish.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -146,6 +149,17 @@ function readJsonSafe(file, fallback, required = false) {
  * 所以：不是普通对象就抛错，让调用方的 try/catch 返回 500（与各端点注释里
  * "配置文件损坏时直接 500，绝不回写" 的既有约定一致）。
  */
+/**
+ * 密钥掩码：只露首尾各 4 位，中间省略。
+ * 空值返回空串——控制台据 hasKey 判断「是否已配置」，不靠掩码本身。
+ */
+function maskSecret(value) {
+  const s = String(value ?? '').trim();
+  if (!s) return '';
+  if (s.length <= 8) return `${s.slice(0, 2)}***`;
+  return `${s.slice(0, 4)}…${s.slice(-4)}`;
+}
+
 function readConfigObject(file) {
   const parsed = readJsonSafe(file, null, true);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -301,6 +315,73 @@ function roleFilePath(name) {
   return path.join(ROLES_DIR, name + '.md');
 }
 
+// ── 角色包：roles/<角色>.pack.json ────────────────────────────────────────────
+// 把「跟着角色走」的参数（TTS 音色、注音字典、唤醒别名）从 config.json 里拿出来，
+// 一个角色一份。切换角色时这些立刻跟着换，不用改 config.json（旧值保留为兜底）。
+//
+// 现读 + 按 mtime 缓存：控制台点一下切换就能生效，不必重启桥接。
+let rolePackCache = { file: '', mtimeMs: 0, pack: null };
+
+function rolePackFile(name) {
+  return path.join(ROLES_DIR, `${name}.pack.json`);
+}
+
+function rolePack() {
+  try {
+    const role = String(readRoleState().role ?? '').trim();
+    if (!role) return null;
+    const file = rolePackFile(role);
+    const stat = fs.statSync(file);
+    if (rolePackCache.file === file && rolePackCache.mtimeMs === stat.mtimeMs) return rolePackCache.pack;
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const pack = parsed && typeof parsed === 'object' ? parsed : null;
+    rolePackCache = { file, mtimeMs: stat.mtimeMs, pack };
+    return pack;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') log(`[role-pack] 读取失败，回退 config：${error?.message ?? error}`);
+    return null;
+  }
+}
+
+/** 当前角色该用的 TTS 音色：角色包优先，没有就回退 config.tts.voiceId。 */
+function roleVoiceId() {
+  const fromPack = String(rolePack()?.voiceId ?? '').trim();
+  return fromPack || String(cfg.tts?.voiceId ?? '').trim();
+}
+
+/** 当前角色该用的注音字典：角色包优先，没有就回退 config.tts.dictionary。 */
+function roleDictionary() {
+  const fromPack = rolePack()?.dictionary;
+  if (fromPack && typeof fromPack === 'object' && Object.keys(fromPack).length) return fromPack;
+  return cfg.tts?.dictionary ?? null;
+}
+
+/** 当前角色的唤醒别名：角色包优先，没有就回退 config.socialV2.wake.aliases。 */
+function roleAliases() {
+  const fromPack = rolePack()?.aliases;
+  if (Array.isArray(fromPack) && fromPack.length) return fromPack;
+  return cfg.socialV2?.wake?.aliases ?? [];
+}
+
+/**
+ * 当前角色在 world.json 里叫什么。
+ * 卡名和资料里的写法不一定一致（「浅仓透」→「浅倉透」、「七草日花」→「七草にちか」），
+ * 所以在角色包里显式写 worldName；没写就退回卡名，匹配不上自然返回 null。
+ */
+function roleWorldName() {
+  const fromPack = String(rolePack()?.worldName ?? '').trim();
+  if (fromPack) return fromPack;
+  return String(readRoleState().role ?? '').trim();
+}
+
+/** 当前角色的世界观提示词（A 档），角色不在资料里时返回 null。 */
+function roleWorldPrompt() {
+  const worldName = roleWorldName();
+  const built = buildWorldPrompt(path.join(ROOT, 'world.json'), worldName);
+  if (!built) log(`[world] 生成失败（worldName=${JSON.stringify(worldName)}，检查 roles/<角色>.pack.json 的 worldName 与 world.json）`);
+  return built;
+}
+
 function firstMeaningfulLine(content) {
   for (const line of String(content ?? '').split('\n')) {
     const t = line.replace(/^#+\s*/, '').replace(/^[-*]\s*/, '').trim();
@@ -362,7 +443,7 @@ function roleSummaries() {
 
 function validateRoleName(raw) {
   const name = sanitizeRoleName(raw);
-  if (!name) throw new Error('人格名不能为空（仅限中文 / 字母 / 数字 / 横线）');
+  if (!name) throw new Error('人格名不能为空（仅限中日文字 / 假名 / 字母 / 数字 / 横线）');
   if (name.length > ROLE_NAME_MAX) throw new Error(`人格名过长（最多 ${ROLE_NAME_MAX} 字）`);
   if (ROLE_RESERVED_NAMES.has(name)) throw new Error(`「${name}」是保留名称`);
   if (WINDOWS_RESERVED_NAMES.has(name.toUpperCase())) throw new Error(`「${name}」是系统保留名称（Windows 设备名），请换一个`);
@@ -626,8 +707,10 @@ function readRoleState() {
 function writeRoleState(role, mode) {
   atomicWriteJson(ROLE_STATE_FILE, { role: role ?? null, mode: mode ?? 'active' });
 }
+// 角色名过滤：保留中日文字、平假名/片假名、字母数字与连字符，去掉路径分隔符等危险字符。
+// 假名必须留着——原来的 [^\w\u4e00-\u9fff-] 会把「七草はづき」削成「七草」。
 function sanitizeRoleName(name) {
-  return String(name ?? '').replace(/[^\w\u4e00-\u9fff-]/g, '');
+  return String(name ?? '').replace(/[^\w\u3040-\u30ff\u4e00-\u9fff\uFF66-\uFF9D-]/g, '');
 }
 
 // 管理员 QQ（ownerQQ）规范化：空值=未设置；必须是正整数 QQ 号。
@@ -656,10 +739,12 @@ function loadConfig() {
     dsh: {
       baseUrl: 'http://127.0.0.1:3080',
       provider: 'deepseek-official',
-      // 多模态模型：DeepSeek-V41-Flash（DSH 模型目录里 inputModalities 含 image）。
-      // 旧默认 deepseek-v4-flash-vision-exp 已被取代；config.json 未配置时用此兜底。
+      // 下面这三项只有在 manageModel=true（覆盖模式）时才生效；
+      // 默认跟随 DSH 全局默认，见 readDshDefaultModel 的注释。
       model: 'deepseek-flash',
       reasoningEffort: 'max',
+      // false（默认）= 跟随 DSH 全局默认；true = 用本段的 provider/model/reasoningEffort 覆盖。
+      manageModel: false,
       // 兼容新版 DSH 的 API 鉴权：如果 DSH 升级后要求非浏览器客户端带 token，
       // 在这里配置 token；默认走 Authorization: Bearer <token>。
       authToken: '',
@@ -690,6 +775,14 @@ function loadConfig() {
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
     consolePort: file.consolePort ?? 3100,
     consoleToken: file.consoleToken ?? '',
+    // 工作日静默时段（UTC+8）：窗口/星期几/节假日模式都在这里配，解析与判定见 quiet-hours.mjs。
+    quietHours: {
+      enabled: true,
+      weekdays: [1, 2, 3, 4, 5],
+      windows: [['09:00', '12:00'], ['14:00', '18:00']],
+      holidays: 'cn',
+      ...(file.quietHours ?? {})
+    },
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
     security: {
@@ -869,6 +962,27 @@ function loadConfig() {
         maxCount: 5
       },
       ...(file.socialV2 ?? {})
+    },
+    // 语音合成（TTS）：把一句日语合成语音再发出去。
+    // 密钥优先取环境变量 FISH_AUDIO_API_KEY，其次 config.json（控制台填）；默认关闭，
+    // 等控制台配好并勾选启用后才真正生效。
+    tts: {
+      enabled: false,
+      provider: 'fish',
+      baseUrl: 'https://api.fish.audio',
+      model: 's2.1-pro-free',
+      // 七草にちか 在 eidolon-sc 里的 Fish Audio 音色
+      voiceId: '',
+      timeoutMs: 15000,
+      keepFiles: 20,
+      // 注音字典：写法 → Fish 音素（取自 eidolon 的 readings.toml，只收与七草相关的名字）。
+      // Fish 按字面子串、区分大小写匹配，所以别收会和普通词撞上的写法。
+      dictionary: {},
+      // 代理只作用于 TTS 请求（手写 CONNECT 隧道），不影响桥接其它出站请求。
+      // 留空 = 直连。Clash 的混合端口一般是 7897。
+      proxy: '',
+      ...(file.tts ?? {}),
+      apiKey: String(process.env.FISH_AUDIO_API_KEY ?? '').trim() || String(file.tts?.apiKey ?? '')
     }
   };
 
@@ -905,6 +1019,7 @@ function loadConfig() {
     collectSticker: true,
     getSelfImage: true,
     sendVoice: false,
+    ttsSay: true,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -918,7 +1033,7 @@ function loadConfig() {
   cfg.socialV2.voice = {
     enabled: false,
     dir: 'audio',
-    maxSeconds: 300,
+    maxSeconds: 60,
     maxBytes: 20 * 1024 * 1024,
     maxPerMinute: 2,
     maxPerHour: 10,
@@ -1381,6 +1496,16 @@ let stateDirHardened = null;
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  // ── 工作日静默时段（09:00–12:00 / 14:00–18:00，UTC+8）────────────────────
+  // 只是状态机：判断"现在该不该静默"，副作用（停定时器、拦消息）由下面各处调用点执行。
+  const quietHours = new QuietHours({
+    config: cfg.quietHours,
+    stateDir: STATE_DIR,
+    log: (message) => log(message),
+  });
+  void quietHours.refreshHolidays().catch(() => {});
+  // 「请用语音说」的一次性请求：key → 时间戳，被唤醒时消费（避免污染 socialV2 状态文件）。
+  const voiceRequests = new Map();
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
   acquireLock();
@@ -1681,6 +1806,48 @@ async function main() {
    * audio 可传音量设置 { volume, normalize, loudness }：SnowLuma 的 record 段没有增益字段，
    * 所以音量必须在本地用 ffmpeg 调好再发（临时文件发完即删）。
    */
+  /**
+   * TTS 一条龙：合成 → 落盘 → 量时长 → 发语音。
+   * 只负责把语音发出去；文字版由调用方决定（试听不发文字）。
+   * @throws {TtsError|Error}
+   */
+  async function ttsSynthesizeAndSend(key, text, { maxSeconds = 60 } = {}) {
+    const t = cfg.tts ?? {};
+    const voice = voiceCfg();
+    // 先按字数预判，别为一段注定超长的文本白等一次合成（日语约 8 字/秒）。
+    const budgetSeconds = Number(maxSeconds) > 0 ? Number(maxSeconds) : 60;
+    const spoken = String(text ?? '').trim();
+    const charBudget = Math.floor(budgetSeconds * 8);
+    if (spoken.length > charBudget) {
+      throw new TtsError('too-long', `文本 ${spoken.length} 字，超过 ${budgetSeconds} 秒上限（约 ${charBudget} 字），未合成`);
+    }
+    const { buffer } = await synthesizeFish({
+      baseUrl: t.baseUrl,
+      apiKey: t.apiKey,
+      model: t.model,
+      voiceId: roleVoiceId(),
+      text,
+      timeoutMs: Number(t.timeoutMs) || 30000,
+      proxyUrl: t.proxy,
+      dictionary: roleDictionary()
+    });
+    const saved = saveTtsAudio(buffer, { voiceDir: voice.dir, keepFiles: Number(t.keepFiles) || 20 });
+    const measured = await measureSeconds(saved.file, { buffer });
+    if (measured.seconds > maxSeconds) {
+      try { fs.unlinkSync(saved.file); } catch {}
+      throw new TtsError('too-long', `语音 ${measured.seconds.toFixed(1)} 秒，超过上限 ${maxSeconds} 秒`);
+    }
+    const sent = await sendVoiceV2(key, saved.file, {
+      guard: false,
+      audit: true,
+      audio: { volume: voice.defaultVolume, normalize: false, loudness: voice.loudness }
+    });
+    // 记下「用的哪个角色、哪个音色」：音色不跟随这类问题只能靠这行日志定位。
+    log(`[tts] ${key} 已发送语音 ${path.basename(saved.file)}（${measured.seconds.toFixed(1)}s，${measured.source}，角色=${String(readRoleState().role ?? '').trim() || '无'}，音色=…${String(roleVoiceId()).slice(-8)}）`);
+    appendActivity(`${key} [tts] 语音 ${measured.seconds.toFixed(1)}s（${measured.source}）`);
+    return { file: saved.file, relative: saved.relative, seconds: measured.seconds, source: measured.source, sent };
+  }
+
   async function sendVoiceV2(key, filePath, { guard = false, audit = true, audio = null } = {}) {
     const vc = voiceCfg();
     // 注意：这里**不检查** vc.enabled —— 那是「AI 能不能发语音」的开关，判定放在
@@ -2297,10 +2464,87 @@ async function main() {
       .map(publicSlangEntry);
   }
 
+  /**
+   * 模糊命中：长度 ≥4 的关键词允许「差一个字」。
+   *
+   * 为什么需要：没人会照着词条原文打字——「野兽先辈」打成「野兽前辈」、
+   * 「114514」打成「114515」，纯子串匹配就漏了。
+   * 长度 2~3 的词**不做**模糊：「担当」差一个字就只剩「担」或「当」，
+   * 那会在普通句子里大面积误触发（「我当然是…」）。
+   */
+  function fuzzyIncludes(text, keyword) {
+    const key = String(keyword ?? '');
+    if (key.length < 4) return false;
+    for (let start = 0; start + key.length <= text.length; start += 1) {
+      let diff = 0;
+      for (let i = 0; i < key.length; i += 1) {
+        if (text[start + i] !== key[i]) {
+          diff += 1;
+          if (diff > 1) break;
+        }
+      }
+      if (diff <= 1) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 用一段文本匹配全库已确认的黑话。命中就把词条塞进唤醒提示——
+   * 比「让模型自己记得去调 qq_slang_query」可靠（实测它不查）。
+   * 词条 content 里的别名（`愚民 / 春阁下（愚民、春閣下）`）都算关键词。
+   */
+  function matchSlangForText(text, limit = 3) {
+    const lower = String(text ?? '').toLowerCase();
+    if (!lower) return [];
+    const hits = [];
+    for (const entry of slangEntries) {
+      if (entry.status !== SLANG_STATUS.CONFIRMED || !entry.content || !entry.meaning) continue;
+      const keys = String(entry.content)
+        .split(/[/、（）()，,]/)
+        .map((s) => s.trim().toLowerCase())
+        // 再补一个「去标点」的变体：没人会打「くっ！」，打「くっ」也得算命中。
+        // 注意别把「ー」当标点删掉（プロデューサー 靠它）。
+        .flatMap((s) => {
+          const stripped = s.replace(/[!！?？。.~…「」『』【】[\]()（）:：;；"'’“”]+/g, '').trim();
+          return stripped && stripped !== s && stripped.length >= 2 ? [s, stripped] : [s];
+        })
+        .filter((s) => s.length >= 2);
+      if (!keys.length) continue;
+      if (keys.some((k) => lower.includes(k)) || keys.some((k) => fuzzyIncludes(lower, k))) {
+        hits.push(entry);
+      }
+      if (hits.length >= limit) break;
+    }
+    return hits;
+  }
+
+  /**
+   * 给一批消息算黑话提示，附在读取类工具的返回里。
+   *
+   * 为什么需要：注入原先只挂在「新一轮唤醒」上。可她常在上一条回合里
+   * qq_wait_for_messages 顺手看到新消息就直接回了——那份 prompt 是上一轮生成的，
+   * 新消息里的梗根本没送进去（实测：@她说 114514 时她正忙，回的是"わかんない"）。
+   * 这条通道补上后，无论从哪条路看到消息，梗都在眼前。
+   */
+  function slangHintFor(messages) {
+    if (cfg.slang?.autoMatch === false) return '';
+    const list = Array.isArray(messages) ? messages : [];
+    if (!list.length) return '';
+    const text = list.map((m) => String(m?.text ?? '')).join(' ');
+    const hits = matchSlangForText(text, 3);
+    if (!hits.length) return '';
+    const block = `【这些消息里的梗】\n${hits.map((e) => `- ${e.content}：${String(e.meaning).slice(0, 70)}`).join('\n')}`;
+    log(`[slang] 命中 ${hits.length} 条，附在读取结果里：${hits.map((e) => e.content).join('、')}`);
+    return block;
+  }
+
   function withSlangContext(promptText) {
     const now = new Date();
     const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
     const parts = [timeLine];
+    // 格式提醒：实测出现过「一条消息三段日语、只有两段中文」的漏翻。
+    // 放在时间行后面（固定内容），不额外破坏缓存前缀；桥接层立即生效，不依赖 DSH 重载 preset。
+    parts.push('【说话格式】每一段日语后面都要紧跟这段的中文字幕；不许出现只有日语、没有中文的段落，发之前先数一遍日语段数和中文段数。');
     if (cfg.slang?.enabled !== false) {
       const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
       if (block) parts.push(block);
@@ -2351,6 +2595,98 @@ async function main() {
       return api.callUnary('session.models', {});
     }
   }
+
+  // ── 跟随 DSH 的全局默认模型 ────────────────────────────────────────────────
+  // 背景（2026-10-21 实测）：桥接原先在 config.json 里写死 provider/model，并在每个会话上
+  // selectModel。该调用**返回成功**，但真实推理仍走 DSH 的全局默认，于是控制台显示的值
+  // （deepseek-account/deepseek-flash）与 state/token-usage.jsonl 里的实际归属
+  // （qwen-token-plan/deepseek-v4.1-flash）对不上。
+  // 现在默认「跟随 DSH」：读 DSH 自己的全局默认（agent-default-model），用它去 selectModel，
+  // 让「显示 = 设置 = 实际」三者一致；在 DSH 里换模型，QQ 这边下一条消息跟随。
+  // 只有 config.json 显式写 dsh.manageModel: true 时才回到「覆盖模式」（用桥接自己的值）。
+  const DSH_DEFAULT_MODEL_ID = 'agent-default-model';
+  const dshDefaultModelCache = { key: null, value: null };
+  function readDshDefaultModel() {
+    try {
+      const profilesDir = path.join(os.homedir(), '.dsh', 'profiles');
+      let entries;
+      try { entries = fs.readdirSync(profilesDir, { withFileTypes: true }); } catch { return null; }
+      const candidates = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const file = path.join(profilesDir, entry.name, 'cordis.patch.yml');
+        let stat;
+        try { stat = fs.statSync(file); } catch { continue; }
+        candidates.push({ profile: entry.name, file, mtimeMs: stat.mtimeMs });
+      }
+      if (!candidates.length) return null;
+      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      // 按「参与比较的文件集合 + mtime」做缓存键：DSH 改设置会动 mtime，缓存自动失效。
+      const cacheKey = candidates.map((c) => `${c.file}:${c.mtimeMs}`).join('|');
+      if (dshDefaultModelCache.key === cacheKey) return dshDefaultModelCache.value;
+      let value = null;
+      for (const candidate of candidates) {
+        let doc;
+        try { doc = yaml.load(fs.readFileSync(candidate.file, 'utf8')); } catch { continue; }
+        if (!Array.isArray(doc)) continue;
+        const item = doc.find((x) => x && typeof x === 'object' && x.id === DSH_DEFAULT_MODEL_ID);
+        const conf = item?.config;
+        if (!conf || typeof conf !== 'object') continue;
+        const provider = String(conf.provider ?? '').trim();
+        const model = String(conf.model ?? '').trim();
+        if (!provider || !model) continue;
+        const effort = String(conf.reasoningEffort ?? '').trim().toLowerCase();
+        value = {
+          provider,
+          model,
+          reasoningEffort: REASONING_EFFORT_OPTIONS.includes(effort) ? effort : null,
+          profile: candidate.profile,
+          file: candidate.file,
+          mtimeMs: candidate.mtimeMs,
+        };
+        break;
+      }
+      dshDefaultModelCache.key = cacheKey;
+      dshDefaultModelCache.value = value;
+      return value;
+    } catch {
+      return null;
+    }
+  }
+
+  // 最近一次真实用量的归属（provider/model）——来自 DSH 的 tokenUsage 投影落盘文件。
+  // 用途：控制台用它显示「实际用量归属」，让管理员能自己核对设置是否真的生效，
+  // 而不是只信桥接报的 selected 值（那正是这次踩的坑）。
+  const lastUsageCache = { key: null, value: null };
+  function readLastUsageModel() {
+    try {
+      let stat;
+      try { stat = fs.statSync(TOKEN_USAGE_FILE); } catch { return null; }
+      const cacheKey = `${stat.mtimeMs}:${stat.size}`;
+      if (lastUsageCache.key === cacheKey) return lastUsageCache.value;
+      const lines = fs.readFileSync(TOKEN_USAGE_FILE, 'utf8').split('\n');
+      let value = null;
+      for (let i = lines.length - 1; i >= 0 && i >= lines.length - 500; i -= 1) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let row;
+        try { row = JSON.parse(line); } catch { continue; }
+        const provider = String(row?.provider ?? '').trim();
+        const model = String(row?.model ?? '').trim();
+        if (!provider || !model) continue;
+        value = { provider, model, at: typeof row.t === 'number' ? row.t : null };
+        break;
+      }
+      lastUsageCache.key = cacheKey;
+      lastUsageCache.value = value;
+      return value;
+    } catch {
+      return null;
+    }
+  }
+  // 「跟随模式下读不到 DSH 默认」只记一次，避免每条消息刷屏
+  const dshDefaultMissLogged = new Set();
+
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
@@ -2950,6 +3286,7 @@ async function main() {
   const SNOWLUMA_STATUS_POLL_MS = 60_000;
   const SNOWLUMA_SILENCE_WARN_MS = Math.max(60_000, Number(cfg.snowluma?.silenceWarnMs) || 10 * 60_000);
   const snowlumaHealth = {
+    connectedAt: 0,       // 最近一次 WS open 的时刻（看门狗用，避免启动瞬间误判）
     lastPacketAt: 0,      // 最近一个来自 SnowLuma 的事件包（含 meta/心跳）
     lastPacketKind: '',
     accountOnline: null,  // bot_status 的 online/offline（需要较新的 SnowLuma 运行时）
@@ -3068,6 +3405,19 @@ async function main() {
     setInterval(() => { void pollSnowlumaStatus(); }, SNOWLUMA_STATUS_POLL_MS);
     // 边沿告警的兜底心跳：主信号（心跳 status.good）到达时会立刻评估，这里只防"心跳也没了"
     setInterval(reportSnowlumaHealth, 30_000);
+    // 连接看门狗：SnowLuma 每 30 秒必发心跳，90 秒一帧都没有说明这条 WebSocket 已经半死
+    // （TCP 还连着、服务端不推了）。实测过一次：心跳正常、消息事件却一条不来，
+    // 表现为「群里说话它完全没反应，日志也干净」。这里直接强制重连。
+    setInterval(() => {
+      if (!snowlumaHealth.connected) return;
+      const since = Math.max(snowlumaHealth.lastPacketAt || 0, snowlumaHealth.connectedAt || 0);
+      if (!since) return;
+      const idleMs = Date.now() - since;
+      if (idleMs <= 90_000) return;
+      log(`⚠️ 已 ${Math.round(idleMs / 1000)} 秒没收到 SnowLuma 任何帧，判定连接半死，强制重连`);
+      try { bot.close(1000, 'stale-watchdog'); } catch {}
+      try { bot.connect(); } catch {}
+    }, 30_000);
   }
 
   // ── 本地控制台（独立 Web 面板，不依赖 DSH WebUI） ───────────────────────────
@@ -3402,6 +3752,8 @@ async function main() {
             allowGroups: cfg.allow?.groups ?? [],
             allowPrivate: cfg.allow?.private ?? [],
             socialV2Paused: socialV2.paused,
+            // 静默时段状态（只给操作者：包含覆盖状态与节假日信息）。
+            quietHours: quietHours.status(),
             // 上游健康只给操作者看：它包含网关诊断信息（good/hint），
             // 属于管理侧观测，不该进 QQ 会话里那个受限的智能体视图。
             snowluma: snowlumaHealthSnapshot(),
@@ -3485,12 +3837,26 @@ async function main() {
               return;
             }
             writeRoleState(name, rs.mode);
-            log(`控制台：角色已设置为 ${name}`);
-            sendJson({ ok: true, role: name });
+            // 换角色后强制重走一次「引导唤醒」：那段提示是命令式的（先调 qq_get_prompt），
+            // 会让她取到新角色卡 + 新世界观。不重置的话，她可能一直带着上一个角色的认知说话。
+            let reset = 0;
+            for (const st of socialV2.conversations.values()) {
+              if (st.bootstrapSent) { st.bootstrapSent = false; reset += 1; }
+            }
+            if (reset) saveSocialV2State();
+            rolePackCache = { file: '', mtimeMs: 0, pack: null };
+            log(`控制台：角色已设置为 ${name}（${reset} 个会话将重走引导唤醒）`);
+            sendJson({ ok: true, role: name, bootstrapReset: reset });
           } else {
             writeRoleState(null, rs.mode);
-            log('控制台：角色已清除');
-            sendJson({ ok: true, role: null });
+            let reset = 0;
+            for (const st of socialV2.conversations.values()) {
+              if (st.bootstrapSent) { st.bootstrapSent = false; reset += 1; }
+            }
+            if (reset) saveSocialV2State();
+            rolePackCache = { file: '', mtimeMs: 0, pack: null };
+            log(`控制台：角色已清除（${reset} 个会话将重走引导唤醒）`);
+            sendJson({ ok: true, role: null, bootstrapReset: reset });
           }
           return;
         }
@@ -3503,16 +3869,42 @@ async function main() {
           sendJson({ ok: true, roleMode: mode });
           return;
         }
+        // ── 静默时段（工作日 09:00–12:00 / 14:00–18:00，UTC+8）─────────────────
+        if (req.method === 'GET' && url.pathname === '/api/quiet-hours') {
+          sendJson(quietHours.status());
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/quiet-hours/override') {
+          const body = await readBody();
+          const kind = ['minutes', 'window', 'day'].includes(body.kind) ? body.kind : 'minutes';
+          const minutes = Number(body.minutes) || 15;
+          quietHours.setOverride(kind, minutes);
+          quietTickNow();
+          sendJson({ ok: true, ...quietHours.status() });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/quiet-hours/clear') {
+          quietHours.clearOverride();
+          quietTickNow();
+          sendJson({ ok: true, ...quietHours.status() });
+          return;
+        }
         // ── 人格管理 ──────────────────────────────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/roles') {
           const rs = readRoleState();
           const summaries = roleSummaries();
+          // 当前角色的世界观用量（A 档），控制台显示「世界观 N 字」用。
+          const world = (() => {
+            const w = roleWorldPrompt();
+            return w ? { chars: w.chars, songs: w.songs, lives: w.lives, asOf: w.asOf } : null;
+          })();
           sendJson({
             // roles 保持「人格名字符串数组」的既有契约（scripts/test-console.mjs 等调用方依赖它）；
             // 富信息放在 summaries 里，新老调用方互不影响。
             roles: summaries.map((role) => role.name),
             summaries,
             current: rs.role ?? null,
+            world,
             limits: { nameMax: ROLE_NAME_MAX, contentMaxBytes: ROLE_CONTENT_MAX_BYTES, injectMaxChars: roleInjectMaxChars },
           });
           return;
@@ -4038,8 +4430,23 @@ async function main() {
 
         // ── DSH 模型与思考强度 ───────────────────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/dsh/model') {
-          const provider = String(cfg.dsh?.provider || 'deepseek-official');
-          const model = String(cfg.dsh?.model || 'deepseek-flash');
+          const followDsh = cfg.dsh?.manageModel !== true;
+          const dshDefault = readDshDefaultModel();
+          const configValue = {
+            provider: String(cfg.dsh?.provider || 'deepseek-official'),
+            model: String(cfg.dsh?.model || 'deepseek-flash'),
+            reasoningEffort: String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT),
+          };
+          // 生效值：跟随模式取 DSH 全局默认；读不到时退回 config 值**仅用于展示**（UI 会说明未生效）
+          const effective = followDsh && dshDefault
+            ? {
+              provider: dshDefault.provider,
+              model: dshDefault.model,
+              reasoningEffort: dshDefault.reasoningEffort ?? '',
+            }
+            : configValue;
+          const provider = effective.provider;
+          const model = effective.model;
           // 档位优先取 DSH 实际公布的能力（DSH 换档位词汇或换 provider 时自动跟随），失败退回内置白名单。
           let options = REASONING_EFFORT_OPTIONS.slice();
           let labels = {};
@@ -4072,19 +4479,37 @@ async function main() {
           sendJson({
             provider,
             model,
-            reasoningEffort: String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT),
+            reasoningEffort: effective.reasoningEffort,
+            // 跟随 DSH（默认）：桥接只把 DSH 的默认同步到会话上，不覆盖成自己的值
+            followDsh,
+            managed: !followDsh,
+            dshDefault,
+            configValue,
+            // 最近一次真实用量的归属：让管理员能自己核对设置是否真的生效
+            lastUsage: readLastUsageModel(),
             options,
             labels,
             default: REASONING_EFFORT_DEFAULT,
             providerDefault,
             catalogSource,
-            // selectModel 会同时写会话级与 DSH 全局默认（~/.dsh/settings.yaml 的 agent-default-model），
-            // 控制台要把这点明确告诉管理员，避免「只想调 QQ 助手却改了 Web GUI 新会话默认」的意外。
-            globalSideEffect: true,
+            // 只有覆盖模式才会把桥接的值推到全局默认上，跟随模式没有这个副作用
+            globalSideEffect: !followDsh,
           });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/dsh/effort') {
+          if (cfg.dsh?.manageModel !== true) {
+            // 跟随模式下改强度是无效操作（原样写进 config.json 会让人以为生效了）。
+            // 直接拒绝并说清怎么切换，避免又制造一次「显示与实际不符」。
+            sendJson({
+              ok: false,
+              followDsh: true,
+              error: '当前是「跟随 DSH」模式：模型和思考强度都由 DSH 全局默认决定，桥接改了也不会生效。'
+                + '要单独给 QQ 助手指定，请在 config.json 里设 dsh.manageModel=true 后重启桥接；'
+                + '只想去 DSH 里改，请在 DSH 的 Web GUI 设置里改（下一条消息生效）。',
+            }, 400);
+            return;
+          }
           const body = await readBody();
           let effort;
           try { effort = normalizeReasoningEffort(body.reasoningEffort); }
@@ -4384,7 +4809,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'ttsSay'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4449,6 +4874,23 @@ async function main() {
               }
             }
             if (merged.proactive.enabled !== undefined) merged.proactive.enabled = merged.proactive.enabled === true;
+            if (merged.proactive.group !== undefined) merged.proactive.group = merged.proactive.group === true;
+            // 私聊默认关：只有显式 true 才算开。
+            if (merged.proactive.private !== undefined) merged.proactive.private = merged.proactive.private === true;
+            if (merged.proactive.maxPerDay !== undefined) {
+              const n = Number(merged.proactive.maxPerDay);
+              merged.proactive.maxPerDay = Number.isFinite(n) ? Math.max(0, Math.round(n)) : (current.proactive?.maxPerDay ?? 4);
+            }
+            if (merged.proactive.windowDays !== undefined) {
+              const n = Number(merged.proactive.windowDays);
+              merged.proactive.windowDays = Number.isFinite(n) ? Math.max(0, Math.round(n)) : (current.proactive?.windowDays ?? 7);
+            }
+            for (const k of ['nightFrom', 'nightTo']) {
+              if (merged.proactive[k] !== undefined) {
+                const raw = String(merged.proactive[k] ?? '').trim();
+                merged.proactive[k] = /^\d{1,2}:\d{2}$/.test(raw) ? raw : (current.proactive?.[k] ?? (k === 'nightFrom' ? '23:30' : '07:00'));
+              }
+            }
             if (merged.proactive.probability !== undefined) merged.proactive.probability = Math.min(1, Math.max(0, Number(merged.proactive.probability) || 0));
           }
           // sticker：表情包体系参数归一化
@@ -4517,6 +4959,18 @@ async function main() {
           const wakeDefaultChanged = body.wake && typeof body.wake === 'object' &&
             WAKE_DEFAULT_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body.wake, k));
           if (wakeDefaultChanged) refreshAllDefaultWakeConfigsV2();
+          // proactive 参数变了：已排的定时器还按旧间隔/旧开关走，清掉重排，保存即生效。
+          if (body.proactive && typeof body.proactive === 'object') {
+            for (const key of socialV2.conversations.keys()) {
+              const st = socialV2.conversations.get(key);
+              if (st?.proactiveTimer) {
+                clearTimeout(st.proactiveTimer);
+                st.proactiveTimer = null;
+              }
+              scheduleProactiveCheckV2(key);
+            }
+            log('控制台：主动搭话参数已更新，已重排全部会话的检查');
+          }
           log('控制台：二代仿真配置已更新');
           sendJson({ ok: true, config: cfg.socialV2 });
           return;
@@ -4646,7 +5100,8 @@ async function main() {
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
-            sendVoice: 'qq_send_voice / qq_list_voices'
+            sendVoice: 'qq_send_voice / qq_list_voices',
+            ttsSay: 'qq_tts_say'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
@@ -4665,6 +5120,12 @@ async function main() {
               line: selfIdentityTextV2().trim() || null
             },
             role: { name: roleState.role ?? null, hint: currentMode === 'reserved2' ? currentRoleHintV2() : currentRoleHint() },
+            // 世界观（A 档）：事务所/组合/「不编造」规则 + 她的歌名 + 她上过的演出。
+            // 放在这里而不是每轮 prompt：跟着角色卡走（切角色即换），进历史后走缓存。
+            world: (() => {
+              const w = roleWorldPrompt();
+              return w ? { asOf: w.asOf, chars: w.chars, songs: w.songs, lives: w.lives, text: w.text } : null;
+            })(),
             recommended: cfg.socialV2?.provideRecommendations === false ? null : {
               wake: cfg.socialV2?.wake ?? {},
               send: cfg.socialV2?.send ?? {},
@@ -4720,7 +5181,7 @@ async function main() {
           const messages = afterSeq === null ? st.unread.slice(-limit)
             : st.unread.filter((m) => Number.isSafeInteger(m.seq) && m.seq > afterSeq).slice(0, limit);
           const readThroughSeq = req.headers['x-agent-token'] ? noteModelMessagesV2(st, messages) : readThroughSeqV2(st);
-          sendJson({ ok: true, key, unreadCount: st.unread.length, messages, readThroughSeq });
+          sendJson({ ok: true, key, unreadCount: st.unread.length, messages, readThroughSeq, slangHint: slangHintFor(messages) || null });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/recent') {
@@ -4736,7 +5197,7 @@ async function main() {
           const end = Math.max(0, st.recentMessages.length - offset);
           const messages = st.recentMessages.slice(start, end);
           const readThroughSeq = req.headers['x-agent-token'] ? noteModelMessagesV2(st, messages) : readThroughSeqV2(st);
-          sendJson({ ok: true, key, messages, readThroughSeq });
+          sendJson({ ok: true, key, messages, readThroughSeq, slangHint: slangHintFor(messages) || null });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/mark-read') {
@@ -4788,6 +5249,11 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('setWakeConfig')) { sendJson({ ok: false, error: '工具未启用：qq_set_wake_config' }, 403); return; }
+          // 静默时段的例外回合不写唤醒配置：写了也会在静默期内被丢弃，白花 token。
+          if (quietHours.isOwnerException(key)) {
+            sendJson({ ok: true, key, quiet: true, ignored: true, note: '静默时段：唤醒配置未写入，回完这条即结束' });
+            return;
+          }
           const st = getSocialV2State(key);
           const throughSeq = requestedReadThroughSeqV2(st, body, !!req.headers['x-agent-token']);
           // Preserve the deployed behavior: with markRead disabled, update wake configuration only.
@@ -4867,6 +5333,18 @@ async function main() {
           // 归一化概率
           if (next.triggers.probability !== undefined) {
             next.triggers.probability = Math.min(1, Math.max(0, Number(next.triggers.probability) || 0));
+          }
+          // AI 通道：概率不低于推荐值（默认 0.05）。
+          // 理由：它在活跃时段把自己调到 0.02 时，普通群消息几乎叫不醒 —— 这跟「潜水」不是一回事。
+          // 操作者通道（控制台）不受限：那是人自己的选择。
+          if (req.headers['x-agent-token']) {
+            const recommended = Number(cfg.socialV2?.wake?.recommendedProbability);
+            const floor = Number.isFinite(recommended) && recommended > 0 ? recommended : 0.05;
+            const finalProb = Number(next.triggers.probability ?? current.triggers?.probability ?? 0);
+            if (Number.isFinite(finalProb) && finalProb < floor) {
+              log(`[reserved2] 唤醒概率被钳制：${finalProb} → ${floor}（${key}）`);
+              next.triggers.probability = floor;
+            }
           }
           // 归一化拍一拍触发（只接受布尔，防脏字符串被当成 true）
           if (input.triggers && typeof input.triggers === 'object' && 'poke' in input.triggers) {
@@ -5830,6 +6308,193 @@ async function main() {
           }
           return;
         }
+        // ── TTS（Fish Audio）：配置读写 + 试听 ──────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/tts/config') {
+          const t = cfg.tts ?? {};
+          const voice = voiceCfg();
+          sendJson({
+            enabled: t.enabled === true,
+            provider: t.provider ?? 'fish',
+            baseUrl: t.baseUrl ?? 'https://api.fish.audio',
+            model: t.model ?? 's2.1-pro-free',
+            voiceId: roleVoiceId(),
+            hasKey: Boolean(String(t.apiKey ?? '').trim()),
+            keyMask: maskSecret(t.apiKey),
+            keyFromEnv: Boolean(String(process.env.FISH_AUDIO_API_KEY ?? '').trim()),
+            proxy: t.proxy ?? '',
+            models: ['s2.1-pro-free', 's2.1-pro', 's2-pro', 'drama-3', 's1'],
+            timeoutMs: Number(t.timeoutMs) || 15000,
+            keepFiles: Number(t.keepFiles) || 20,
+            maxSeconds: voice.maxSeconds,
+            maxPerMinute: voice.maxPerMinute,
+            maxPerHour: voice.maxPerHour
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/tts/config') {
+          const body = await readBody();
+          const configFile = path.join(ROOT, 'config.json');
+          const file = readConfigObject(configFile);
+          const current = file.tts && typeof file.tts === 'object' && !Array.isArray(file.tts) ? file.tts : {};
+          const next = { ...current };
+          if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
+          if (typeof body.baseUrl === 'string' && body.baseUrl.trim()) next.baseUrl = body.baseUrl.trim();
+          if (typeof body.model === 'string' && body.model.trim()) next.model = body.model.trim();
+          // 音色：当前角色有角色包就写进角色包（那才是生效的地方），否则写 config。
+          // 不这样分叉的话，控制台改完音色看着"保存成功"，实际被角色包盖住，等于没改。
+          let wrotePackVoice = false;
+          if (typeof body.voiceId === 'string' && body.voiceId.trim()) {
+            const voiceId = body.voiceId.trim();
+            const packRole = String(readRoleState().role ?? '').trim();
+            if (packRole && fs.existsSync(rolePackFile(packRole))) {
+              try {
+                const packFile = rolePackFile(packRole);
+                const pack = JSON.parse(fs.readFileSync(packFile, 'utf8'));
+                pack.voiceId = voiceId;
+                atomicWriteJson(packFile, pack);
+                rolePackCache = { file: '', mtimeMs: 0, pack: null };
+                wrotePackVoice = true;
+              } catch (error) {
+                log(`[role-pack] 写音色失败，改存 config：${error?.message ?? error}`);
+              }
+            }
+            if (!wrotePackVoice) next.voiceId = voiceId;
+          }
+          // 代理：空串是合法值（= 直连），所以这里不做 trim 判空跳过。
+          if (typeof body.proxy === 'string') next.proxy = body.proxy.trim();
+          // 密钥只在显式传了非空值、且不是占位符时才覆盖：
+          // 否则「只改模型」这一类保存会把已有 key 清空。
+          if (typeof body.apiKey === 'string' && body.apiKey.trim() && body.apiKey !== '__KEEP__') {
+            next.apiKey = body.apiKey.trim();
+          }
+          file.tts = next;
+          atomicWriteJson(configFile, file);
+          cfg.tts = { ...cfg.tts, ...next };
+          const fromEnv = Boolean(String(process.env.FISH_AUDIO_API_KEY ?? '').trim());
+          log(`控制台：TTS 配置已更新（model=${next.model ?? '?'}，key=${String(next.apiKey ?? '').trim() ? '已配置' : '未配置'}${fromEnv ? '，环境变量优先' : ''}）`);
+          sendJson({ ok: true, hasKey: Boolean(String(next.apiKey ?? '').trim()), keyMask: maskSecret(next.apiKey), keyFromEnv: fromEnv });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/tts/test') {
+          // 只合成、不发送：用来分辨「网络/代理不通」「key 不对」「模型不可用」。
+          const t = cfg.tts ?? {};
+          const started = Date.now();
+          try {
+            const { buffer } = await synthesizeFish({
+              baseUrl: t.baseUrl,
+              apiKey: t.apiKey,
+              model: t.model,
+              voiceId: roleVoiceId(),
+              text: 'てすと',
+              timeoutMs: Number(t.timeoutMs) || 15000,
+              proxyUrl: t.proxy
+            });
+            sendJson({
+              ok: true,
+              ms: Date.now() - started,
+              bytes: buffer.length,
+              seconds: Number(estimateMp3Seconds(buffer).toFixed(1)),
+              model: t.model ?? '',
+              baseUrl: t.baseUrl ?? ''
+            });
+          } catch (error) {
+            const code = error instanceof TtsError ? error.code : 'unknown';
+            log(`[tts] 连通性测试失败（${code}）：${error?.message ?? error}`);
+            sendJson({ ok: false, code, error: error?.message ?? String(error), ms: Date.now() - started }, 502);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/tts/preview') {
+          const body = await readBody();
+          const key = String(body.target ?? '').trim();
+          const parsedTarget = parseTargetKey(key);
+          if (!parsedTarget) { sendJson({ ok: false, error: 'target 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (!modeAllowed(key, parsedTarget.kind, Number(parsedTarget.id), cfg, currentMode)) {
+            sendJson({ ok: false, error: `目标 ${key} 不在白名单内` }, 403);
+            return;
+          }
+          const text = String(body.text ?? '').trim();
+          if (!text) { sendJson({ ok: false, error: '试听文本不能为空' }, 400); return; }
+          const voice = voiceCfg();
+          const now = Date.now();
+          try {
+            voiceBudgetCheck('operator:tts', voice);
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 429);
+            return;
+          }
+          try {
+            const result = await ttsSynthesizeAndSend(key, text, { maxSeconds: voice.maxSeconds });
+            voiceBudgetCommit('operator:tts', now);
+            sendJson({
+              ok: true, key, file: result.relative,
+              seconds: Number(result.seconds.toFixed(2)), source: result.source,
+              messageId: result.sent?.messageId ?? null
+            });
+          } catch (error) {
+            const code = error instanceof TtsError ? error.code : 'unknown';
+            log(`[tts] 试听失败（${code}）：${error?.message ?? error}`);
+            sendJson({ ok: false, code, error: error?.message ?? String(error) }, code === 'auth' || code === 'no-key' || code === 'too-long' ? 400 : 502);
+          }
+          return;
+        }
+        // ── TTS：AI 通道（qq_tts_say）──────────────────────────────────────
+        // 顺序固定：先发语音，再发文字版「日语 + 中文字幕」。失败时把 code 交给 AI，
+        // 由它决定降级（提示词里要求：失败就用普通发送，别在群里报错）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/tts-say') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const ja = String(body.ja ?? '').trim();
+          const zh = String(body.zh ?? '').trim();
+          const voice = voiceCfg();
+          const ttsCfg = cfg.tts ?? {};
+          // 只看 tts.enabled：socialV2.voice.enabled 管的是「发语音库里的文件」（qq_send_voice），
+          // 两条路的开关分开，否则管理员勾一个开关却发现另一个没开。
+          if (ttsCfg.enabled !== true) { sendJson({ ok: false, error: 'TTS 未启用（tts.enabled，控制台「语音」卡）' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (!ja) { sendJson({ ok: false, error: 'ja（要念出来的日语原文）不能为空' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('ttsSay')) { sendJson({ ok: false, error: '工具未启用：qq_tts_say' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          const now = Date.now();
+          try {
+            voiceBudgetCheck(key, voice);
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 429);
+            return;
+          }
+          try {
+            const result = await ttsSynthesizeAndSend(key, ja, { maxSeconds: voice.maxSeconds });
+            voiceBudgetCommit(key, now);
+            // 语音已发出，紧接着补文字版（纯文本，不带话音标记）。
+            const text = zh ? `${ja}\n\n${zh}` : ja;
+            await sendToQQ(key, text);
+            sendJson({
+              ok: true, key,
+              seconds: Number(result.seconds.toFixed(2)),
+              source: result.source,
+              messageId: result.sent?.messageId ?? null,
+              textSent: true
+            });
+          } catch (error) {
+            const code = error instanceof TtsError ? error.code : 'unknown';
+            log(`[tts] 发送失败（${code}）：${error?.message ?? error}`);
+            sendJson({ ok: false, code, error: error?.message ?? String(error) }, 502);
+          }
+          return;
+        }
         // 语音库列表。两条通道共用：
         //   - 带 agent token（AI 的 qq_list_voices）→ 必须带 key，校验会话白名单/工具开关；
         //   - 不带 agent token（控制台调试面板 / CLI）→ 只需控制台令牌，不需要 key。
@@ -5989,6 +6654,11 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('waitMessages')) { sendJson({ ok: false, error: '工具未启用：qq_wait_for_messages' }, 403); return; }
+          // 静默时段的例外回合：回完即停，不允许等待（否则会把工作时段拖成一场长对话）。
+          if (quietHours.isOwnerException(key)) {
+            sendJson({ ok: false, quiet: true, error: '静默时段：这是回完即停的一次性回合，不要等待；直接发送回复，再用 qq_mark_read 提交水位收尾。' }, 409);
+            return;
+          }
           if (socialV2.paused) {
             const st = getSocialV2State(key);
             sendJson({ ok: true, key, paused: true, arrived: false, timeout: false, waitedMs: 0, newMessages: [], readThroughSeq: readThroughSeqV2(st), unreadCount: st.unread.length });
@@ -6156,6 +6826,7 @@ async function main() {
             ...(!replyWait ? { preSleepWaitMs, preSleepWaitRemainingMs: preSleepRemainingMs } : {}),
             newMessages,
             readThroughSeq,
+            slangHint: slangHintFor(newMessages) || null,
             unreadCount: st.unread.length
           });
           return;
@@ -6649,18 +7320,25 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('slangQuery')) { sendJson({ ok: false, error: '工具未启用：qq_slang_query' }, 403); return; }
-          const list = confirmedSlangListV2().filter((e) => {
-            if (!q) return true;
-            return e.content.toLowerCase().includes(q)
+          // 查询要搜**全库**，不能只搜"注入用的前 N 条"：
+          // confirmedSlangListV2() 会按使用次数截断到 injectMax（默认 8），
+          // 词库一大，后面导入的词就永远查不到。
+          const pool = slangEntries.filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning);
+          const matched = (q
+            ? pool.filter((e) => e.content.toLowerCase().includes(q)
               || e.meaning.toLowerCase().includes(q)
               || e.usage.toLowerCase().includes(q)
-              || e.example.toLowerCase().includes(q);
-          });
+              || e.example.toLowerCase().includes(q))
+            : pool
+          )
+            .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
+            .slice(0, 20)
+            .map(publicSlangEntry);
           sendJson({
             ok: true,
             key,
-            total: list.length,
-            entries: list,
+            total: matched.length,
+            entries: matched,
             block: buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8)
           });
           return;
@@ -7873,34 +8551,85 @@ async function main() {
 
   // 会话模型应用去重：每个 DSH 会话在本进程内只 selectModel 一次；
   // 控制台热切换思考强度时递增 modelSelectionEpoch，使旧记录失效并在下一条消息重新应用。
-  // 四种 QQ 模式共用 DSH 会话，统一强制使用多模态模型 DeepSeek-V41-Flash（id: deepseek-flash）；
-  // 它同时支持 text/image 输入，取代已下线的 deepseek-v4-flash-vision-exp。
-  const modelAppliedSessions = new Map(); // sessionId -> 已应用的 modelSelectionEpoch
+  // 四种 QQ 模式共用 DSH 会话。默认**跟随 DSH 的全局默认模型**（见 readDshDefaultModel）：
+  // 之前写死 deepseek-flash 是为了多模态输入，但实测 selectModel 名义成功、实际仍走 DSH 默认，
+  // 于是控制台显示的值与 state/token-usage.jsonl 的归属脱节；跟随之后「显示 = 设置 = 实际」一致。
+  // sessionId -> 已应用的模型签名（跟随模式 = DSH 默认值；覆盖模式 = config 值 + modelSelectionEpoch）。
+  // 用签名而不是单纯 epoch：在 DSH 里改了全局默认后，签名变化能让这里自动重新对齐。
+  const modelAppliedSessions = new Map();
   // 返回 'applied' | 'not-found' | 'failed'。
   // 'not-found' 表示 DSH 侧会话已经不存在（DSH 重启、异常退出、归档竞态），
   // 本地映射已失效，调用方必须退役重建，否则每条消息都会对着一个不存在的会话重试。
   async function ensureChatModel(sessionId) {
-    if (modelAppliedSessions.get(sessionId) === modelSelectionEpoch) return 'applied';
-    const provider = String(cfg.dsh?.provider || 'deepseek-official');
-    const model = String(cfg.dsh?.model || 'deepseek-flash');
-    const effort = String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
+    const follow = cfg.dsh?.manageModel !== true;
+    let provider;
+    let model;
+    let effort;
+    let origin;
+    let signature;
+    // 默认「跟随 DSH」：用 DSH 全局默认的 provider/model/effort，而不是桥接写死的值。
+    // 读不到时宁可不设置，也不要用别的值把会话绑走——那正是这次要修的问题。
+    if (follow) {
+      const preset = readDshDefaultModel();
+      if (!preset) {
+        const reason = '读不到 DSH 全局默认（~/.dsh/profiles/*/cordis.patch.yml 里没有 agent-default-model）';
+        if (!dshDefaultMissLogged.has(reason)) {
+          dshDefaultMissLogged.add(reason);
+          log(`ℹ️  ${reason}，本次不设置会话模型，交由 DSH 决定（要改回覆盖模式：config.json 里设 dsh.manageModel=true）`);
+        }
+        modelAppliedSessions.set(sessionId, 'dsh:none');
+        return 'applied';
+      }
+      provider = preset.provider;
+      model = preset.model;
+      // DSH 默认没写 effort 时不要替它猜：桥接内置的 REASONING_EFFORT_DEFAULT 是给 DeepSeek 用的，
+      // 换到别的 provider（grok 等）会直接 session/model-unavailable。空串 = 交给模型默认。
+      effort = preset.reasoningEffort || '';
+      origin = `DSH 默认/${preset.profile}`;
+      // 签名里带值：在 DSH 里改了全局默认，签名随之变化，这里会自动重新对齐，
+      // 而不是因为「本会话已应用过」就一直沿用旧值。
+      signature = `dsh:${provider}/${model}/${effort}`;
+    } else {
+      provider = String(cfg.dsh?.provider || 'deepseek-official');
+      model = String(cfg.dsh?.model || 'deepseek-flash');
+      effort = String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
+      origin = 'config.json 覆盖';
+      // 覆盖模式额外带 epoch：控制台改强度后强制重设。
+      signature = `cfg:${provider}/${model}/${effort}:${modelSelectionEpoch}`;
+    }
+    if (modelAppliedSessions.get(sessionId) === signature) return 'applied';
     let lastError = null;
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let attemptEffort = effort;
+    let attempts = 0;
+    // 正常 2 次；若模型不支持指定 effort，会清空 effort 再试一轮（最多 3 次调用）。
+    while (attempts < 2) {
+      attempts += 1;
       try {
-        const result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
-        modelAppliedSessions.set(sessionId, modelSelectionEpoch);
-        log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
+        const params = { sessionId, provider, model };
+        if (attemptEffort) params.reasoningEffort = attemptEffort;
+        const result = unwrap(await api.sessions.selectModel(params), 'session.selectModel');
+        modelAppliedSessions.set(sessionId, signature);
+        log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})｜来源 ${origin}`);
         return 'applied';
       } catch (error) {
         lastError = error;
-        log(`设置会话模型失败 ${sessionId}（第 ${attempt}/2 次）: ${error?.message ?? error}`);
-        if (attempt < 2) await sleep(1000);
+        const message = String(error?.message ?? error);
+        log(`设置会话模型失败 ${sessionId}（第 ${attempts} 次）: ${message}`);
+        // 该模型不支持这个思考强度（grok 等 provider 完全没有 effort 概念）：
+        // 去掉 effort 再试一次，否则每个会话的每条消息都会卡在这里失败。
+        if (attemptEffort && /does not support reasoning effort/i.test(message)) {
+          attemptEffort = '';
+          signature = `dsh:${provider}/${model}/default`;
+          attempts = 0;
+          continue;
+        }
+        if (attempts < 2) await sleep(1000);
       }
     }
     const message = String(lastError?.message ?? lastError ?? '');
     if (/not[- ]?found/i.test(message)) {
-      // 终态失败：记下 epoch，避免退役前（或退役失败时）被反复重试刷屏。
-      modelAppliedSessions.set(sessionId, modelSelectionEpoch);
+      // 终态失败：记下签名，避免退役前（或退役失败时）被反复重试刷屏。
+      modelAppliedSessions.set(sessionId, signature);
       return 'not-found';
     }
     return 'failed';
@@ -8238,6 +8967,10 @@ async function main() {
         proactiveTimer: null,
         rateLimitRetryTimer: null,
         lastIncomingAt: 0,
+        proactiveSentAt: 0,
+        proactiveDay: '',
+        proactiveCountToday: 0,
+        proactiveWakePendingAt: 0,
         preSleepWaitSatisfiedAt: 0,
         preSleepWaitObservedAt: 0,
         preSleepWaitAccumMs: 0,
@@ -8306,6 +9039,10 @@ async function main() {
             replyCheckTimer: null,
             proactiveTimer: null,
             lastIncomingAt: Number(val.lastIncomingAt) || 0,
+            proactiveSentAt: Number(val.proactiveSentAt) || 0,
+            proactiveDay: String(val.proactiveDay ?? ''),
+            proactiveCountToday: Number(val.proactiveCountToday) || 0,
+            proactiveWakePendingAt: Number(val.proactiveWakePendingAt) || 0,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
             preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
@@ -8395,6 +9132,10 @@ async function main() {
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
           lastIncomingAt: st.lastIncomingAt || 0,
+          proactiveSentAt: st.proactiveSentAt || 0,
+          proactiveDay: st.proactiveDay || '',
+          proactiveCountToday: st.proactiveCountToday || 0,
+          proactiveWakePendingAt: st.proactiveWakePendingAt || 0,
           preSleepWaitSatisfiedAt: st.preSleepWaitSatisfiedAt || 0,
           preSleepWaitObservedAt: st.preSleepWaitObservedAt || 0,
           preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
@@ -9719,6 +10460,19 @@ async function main() {
   function recordSentMessagesV2(key, messages) {
     const st = getSocialV2State(key);
     const now = Date.now();
+    // 主动搭话：只有「真的把消息发出去了」才算一次（AI 被唤起后选择沉默不该消耗当天额度，
+    // 也不该让她进入「等对方回复」的状态）。pending 只在 proactive 唤醒时打上，10 分钟内有效。
+    if (st.proactiveWakePendingAt && now - Number(st.proactiveWakePendingAt) < 10 * 60 * 1000 && Array.isArray(messages) && messages.length > 0) {
+      const today = localDayKeyV2();
+      if (st.proactiveDay !== today) {
+        st.proactiveDay = today;
+        st.proactiveCountToday = 0;
+      }
+      st.proactiveSentAt = now;
+      st.proactiveCountToday = Number(st.proactiveCountToday || 0) + 1;
+      st.proactiveWakePendingAt = 0;
+      saveSocialV2State();
+    }
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
     for (let i = 0; i < list.length; i++) {
@@ -9843,6 +10597,36 @@ async function main() {
     return text;
   }
 
+  /**
+   * 「叫名字」要认的名字集合：QQ 昵称切段 + config 里的别名。
+   *
+   * 为什么不能只用 selfNickname：它是网关抓来的整串昵称（如「七草にちか=mk4」），
+   * 除非有人原样打出那 11 个字符，否则 nameMention 永远不会命中——等于这个开关是死的。
+   * 别名由 config.socialV2.wake.aliases 维护（默认：日花 / にちか / 七草 / 七草日花）。
+   * 只收长度 ≥2 的词，避免「ちか」这类短词误伤「近く（ちかく）」。
+   */
+  function selfNameKeys() {
+    const keys = new Set();
+    // 角色包的别名优先，而且**有别名时不再用 QQ 昵称**：
+    // 昵称是账号的，切角色不会自动改——昵称里留着「七草にちか」的话，
+    // 切成浅仓透之后喊「七草」还会把透叫醒（喊七草、透答应）。
+    const aliases = roleAliases();
+    for (const alias of aliases) {
+      const token = String(alias ?? '').trim().toLowerCase();
+      // 单字别名（如「透」）照收：那是角色包里显式写的，代表用户接受这点误触发。
+      if (token.length >= 1) keys.add(token);
+    }
+    if (keys.size) return [...keys];
+    const nickname = String(selfNickname ?? '').trim().toLowerCase();
+    if (nickname) {
+      for (const part of nickname.split(/[=_\-|/\s、,，]+/)) {
+        const token = part.trim();
+        if (token.length >= 2) keys.add(token);
+      }
+    }
+    return [...keys];
+  }
+
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
     const tr = st.wakeConfig?.triggers ?? {};
@@ -9851,11 +10635,12 @@ async function main() {
       const atSelf = Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''));
       if (atSelf || quoteTargetIsSelf) return 'atMention';
     }
-    if (tr.nameMention && selfNickname) {
+    if (tr.nameMention) {
       // 用 plainContent（当前消息自己的文字）：textContent 含 `[引用 某人：原文]`，
       // 引用一条恰好提到机器人昵称的旧消息不该算「叫了名字」（那是被动触发的付费回合）。
       const lower = String(plainContent ?? '').toLowerCase();
-      if (lower.includes('@' + selfNickname.toLowerCase()) || lower.includes(selfNickname.toLowerCase())) return 'nameMention';
+      const hit = selfNameKeys().find((name) => lower.includes(name));
+      if (hit) return `nameMention:${hit}`;
     }
     if (Array.isArray(tr.keywords) && tr.keywords.length) {
       const lower = String(plainContent ?? '').toLowerCase();
@@ -10006,8 +10791,33 @@ async function main() {
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    // 静默时段的一次性回合：只回这一条，回完即停。这里覆盖掉下面那些「等待/潜水/主动」的长提示。
+    if (quietHours.isOwnerException(key)) {
+      return `${roleLine}${identityLine}${tokenLine}【静默时段例外】现在是工作日的静默时段，只有管理员 @/引用时才会叫醒你。\n只处理这一条：\n1. 回复简短，就事论事，别展开闲聊。\n2. 发送后立即结束：不要调用 qq_wait_for_messages，不要设置下一次唤醒，不要追问或补话。\n3. 收尾用 qq_mark_read 提交你读到的水位即可；工具会拒绝等待与唤醒设置。\n`;
+    }
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
+    // 这条消息里出现的黑话：命中就精准注入那几条。
+    // 比「让模型自己想起来调 qq_slang_query」可靠——实测它根本不查。
+    // 匹配窗口默认最近 15 条（slang.matchWindow 可调）：太窄的话，梗刷过去两轮就再也吃不到。
+    // unread 与 recentMessages 有重叠，按 seq 去重后再取窗口。
+    const matchWindow = Math.max(3, Math.min(50, Number(cfg.slang?.matchWindow) || 15));
+    const seenSeqs = new Set();
+    const windowTexts = [];
+    for (const message of [...(st.recentMessages ?? []), ...(st.unread ?? [])]) {
+      const id = String(message?.seq ?? message?.messageId ?? message?.message_id ?? '');
+      if (id) {
+        if (seenSeqs.has(id)) continue;
+        seenSeqs.add(id);
+      }
+      windowTexts.push(String(message?.text ?? ''));
+    }
+    const recentText = windowTexts.slice(-matchWindow).join(' ');
+    const slangHits = cfg.slang?.autoMatch === false ? [] : matchSlangForText(recentText, 3);
+    if (slangHits.length) log(`[slang] 命中 ${slangHits.length} 条，注入本轮唤醒：${slangHits.map((e) => e.content).join('、')}`);
+    const slangHitLine = slangHits.length
+      ? `【这条消息里的梗】\n${slangHits.map((e) => `- ${e.content}：${String(e.meaning).slice(0, 70)}`).join('\n')}\n\n`
+      : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
@@ -10048,7 +10858,13 @@ async function main() {
     // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
     const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    // 有人明确说了「用语音说」：这一轮给一次性提示（消费后立刻清掉，避免下轮重复）。
+    const voiceAskedAt = voiceRequests.get(key);
+    const voiceLine = voiceAskedAt && Date.now() - voiceAskedAt < 120000
+      ? '【语音请求】对方明确要求你用声音回应：请调用 qq_tts_say(ja, zh) 把这句话念出来（ja 只放日语台词，zh 是对应中文字幕）。发完不要再重复发一遍同样的文字。\n\n'
+      : '';
+    if (voiceAskedAt) voiceRequests.delete(key);
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + voiceLine + slangHitLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -10059,7 +10875,27 @@ async function main() {
       return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，需要短静默就用 qq_wait_for_messages(purpose="reply") 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'proactiveCheck') {
-      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      const isPrivate = key.startsWith('private:');
+      const place = isPrivate ? '这边私聊' : '群里';
+      const audience = isPrivate ? '对方' : '群友';
+      return `${base}【主动机会】${key}
+原因：${place}已经安静了一段时间，这是一次你可以先开口的机会——没人叫你，是你自己想说话。
+
+【由头，按这个顺序挑】
+1. 先接你们最近聊过的事、${audience}最近的近况（翻最近消息和记忆）；
+2. 其次才是现在的时间、日期、最近的热点/新闻/网络梗——想用就去搜（mcp__web-search-safe__web_search），但只挑和话题真正搭得上的；
+3. 都没有，就说你自己那边的事。
+
+【怎么说】
+- 不要只发一句空的问候（「早安」「在吗」「想你了」这类），要有具体想说的事。
+- 写一到两段，别太长。
+- 别和你前几次先开口时用一样的开头、一样的由头。
+- 说到你自己：只说练习、拍摄、事务所的日常，或者世界观里写了日期的 live 和新歌；不要编具体剧情，也不要说别的偶像做了什么。
+- 不发照片，也不说要发照片、要打电话。
+- 让${isPrivate ? '他' : '大家'}好接话，但不必每句都用问句结尾。
+
+【实在没话】
+确实没有想说的，就安静收尾（qq_mark_read 或 qq_set_wake_config），不用硬凑。`;
     }
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
@@ -10080,11 +10916,18 @@ async function main() {
   async function sendWakePromptV2(key, reason) {
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
+    if (quietPauseProactive() && !quietHours.isOwnerException(key)) {
+      quietHours.noteSuppressed();
+      log(`[quiet] 静默期不投递唤醒 ${key}（${reason}）`);
+      return;
+    }
     if (!isSessionAllowedInCurrentMode(key)) {
       log(`[reserved2] 跳过唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
     }
     const st = getSocialV2State(key);
+    // 不是主动搭话的唤醒：清掉可能残留的 proactive pending，避免普通回复被算成主动开口。
+    if (reason !== 'proactiveCheck') st.proactiveWakePendingAt = 0;
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
     if (isConversationBusyV2(key, st)) {
@@ -10209,9 +11052,66 @@ async function main() {
     st.replyCheckTimer = null;
   }
 
+  // ── 静默时段闸门 ────────────────────────────────────────────────────────────
+  // 静默/覆盖期间一律不许「主动」：不排主动机会、不排回复检查、不排潜水定时器、
+  // 不投递任何唤醒。唯一的例外是静默期内管理员 @ 触发的一次性回合（markOwnerException）。
+  function quietPauseProactive() {
+    return quietHours.blocksProactive();
+  }
+
+  /** 静默中把主动机会推迟到窗口结束后再排（覆盖期间同样推迟到覆盖结束）。 */
+  function scheduleProactiveCheckAfterQuiet(key) {
+    const st = getSocialV2State(key);
+    if (st.proactiveTimer) return;
+    const status = quietHours.status();
+    const until = Number(status.until) || 0;
+    const delay = Math.max(60 * 1000, Math.min(6 * 60 * 60 * 1000, until ? until - Date.now() + 5000 : 10 * 60 * 1000));
+    st.proactiveTimer = setTimeout(() => {
+      st.proactiveTimer = null;
+      scheduleProactiveCheckV2(key);
+    }, delay);
+    st.proactiveTimer.unref?.();
+    log(`[quiet] 主动机会推迟 ${Math.round(delay / 60000)} 分钟（静默/覆盖中）${key}`);
+  }
+
+  /**
+   * 每分钟检查一次状态切换：进入静默就清掉所有自主定时器，退出静默再排回去。
+   * 边界上不依赖任何一次消息到达，重启时也会自然进入正确状态。
+   */
+  let quietTickNow = () => {};
+  function startQuietTicker() {
+    let last = quietHours.state().state;
+    log(`[quiet] 静默时段已加载：当前 ${last}（工作日 ${quietHours.status().windows.map((w) => w.join('-')).join('、')}，UTC+8）`);
+    const tick = () => {
+      try {
+        quietHours.pruneExpired();
+        void quietHours.refreshHolidays().catch(() => {});
+        const now = quietHours.state().state;
+        if (now === last) return;
+        last = now;
+        if (now === 'normal') {
+          log('[quiet] 静默结束，恢复正常');
+          for (const key of socialV2.conversations.keys()) {
+            if (isSessionAllowedInCurrentMode(key)) scheduleProactiveCheckV2(key);
+          }
+          return;
+        }
+        log(`[quiet] 进入${now === 'override' ? '临时覆盖（被动模式）' : '静默时段'}：停止所有自主定时器`);
+        for (const key of socialV2.conversations.keys()) clearSocialV2Timers(key);
+      } catch (error) {
+        log(`[quiet] tick 异常：${error?.message ?? error}`);
+      }
+    };
+    tick();
+    quietTickNow = tick;
+    const timer = setInterval(tick, 60 * 1000);
+    timer.unref?.();
+  }
+
   function scheduleReplyCheckV2(key) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (quietPauseProactive()) return;
     const st = getSocialV2State(key);
     // 已有真实唤醒/有限睡眠/回复检查在排队时不再重复安排，避免 AI 被连环唤醒。
     if (st.pendingWakeTimer || st.sleepTimer || st.replyCheckTimer) return;
@@ -10297,6 +11197,12 @@ async function main() {
   function scheduleWakeV2(key, reason) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused) return;
+    // 静默/覆盖期间：只放行管理员 @ 触发的一次性回合，其它唤醒一律丢掉。
+    if (quietPauseProactive() && !quietHours.isOwnerException(key)) {
+      quietHours.noteSuppressed();
+      log(`[quiet] 静默期丢弃唤醒 ${key}（${reason}）`);
+      return;
+    }
     if (!isSessionAllowedInCurrentMode(key)) {
       log(`[reserved2] 跳过计划唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
@@ -10383,6 +11289,7 @@ async function main() {
 
   function setupSleepTimerV2(key) {
     if (cfg.socialV2?.enabled === false) return;
+    if (quietPauseProactive()) return;
     if (!isSessionAllowedInCurrentMode(key)) return;
     const st = getSocialV2State(key);
     cancelReplyCheckV2(key); // 有限睡眠配置已接管，取消回复检查
@@ -10428,32 +11335,100 @@ async function main() {
     st.proactiveTimer = null;
   }
 
+  // 夜间禁止窗口（例如 23:30–07:00）：返回「还需要等多少毫秒」；不在窗口内返回 0。
+  // 支持跨午夜（from > to）；from === to 视为没有夜间窗口。
+  function nightWindowDelayMsV2(p) {
+    const parse = (v, dflt) => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(String(v ?? '').trim());
+      if (!m) return dflt;
+      const h = Number(m[1]);
+      const mi = Number(m[2]);
+      if (!Number.isFinite(h) || !Number.isFinite(mi) || h > 23 || mi > 59) return dflt;
+      return h * 60 + mi;
+    };
+    const from = parse(p.nightFrom, 23 * 60 + 30);
+    const to = parse(p.nightTo, 7 * 60);
+    if (from === to) return 0;
+    const now = new Date();
+    const cur = now.getHours() * 60 + now.getMinutes();
+    const inNight = from < to ? (cur >= from && cur < to) : (cur >= from || cur < to);
+    if (!inNight) return 0;
+    let mins = to - cur;
+    if (mins <= 0) mins += 24 * 60;
+    // 窗口结束后再随机 0–2 小时，避免每天都是同一个整点冒泡。
+    const extra = Math.floor(Math.random() * 120);
+    return (mins + extra) * 60 * 1000;
+  }
+
+  function localDayKeyV2() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
   function scheduleProactiveCheckV2(key) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
+    if (quietPauseProactive()) {
+      scheduleProactiveCheckAfterQuiet(key);
+      return;
+    }
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};
+    // 群/私聊分别开关：私聊默认关（只有配置里显式 private:true 才允许主动私聊）。
+    if (key.startsWith('private:') && p.private !== true) return;
+    if (key.startsWith('group:') && p.group === false) return;
     const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
     const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
-    const delay = Math.floor(min + Math.random() * (max - min));
+    let delay = Math.floor(min + Math.random() * (max - min));
+    // 夜间禁止：落在窗口里就直接排到窗口结束后（+0~2 小时），不要夜里反复空转。
+    const nightDelay = nightWindowDelayMsV2(p);
+    if (nightDelay > 0) delay = nightDelay;
     st.proactiveTimer = setTimeout(() => {
       st.proactiveTimer = null;
       ensureWakeableV2(st, { key });
+      // 定时器可能跨过了夜间边界，这里是第二次校验。
+      if (nightWindowDelayMsV2(p) > 0) {
+        scheduleProactiveCheckV2(key);
+        return;
+      }
       const idleThreshold = Number(p.idleThresholdMs) || 15 * 60 * 1000;
       const idle = Date.now() - (st.lastIncomingAt || 0);
+      const windowDays = Number(p.windowDays);
+      if (windowDays > 0 && st.lastIncomingAt && Date.now() - st.lastIncomingAt > windowDays * 86400000) {
+        log(`[reserved2] 主动机会跳过 ${key}：${windowDays} 天内没人说话`);
+        scheduleProactiveCheckV2(key);
+        return;
+      }
+      // 每天上限（按本地日期重置）。
+      const today = localDayKeyV2();
+      if (st.proactiveDay !== today) {
+        st.proactiveDay = today;
+        st.proactiveCountToday = 0;
+      }
+      const maxPerDay = Number(p.maxPerDay);
+      if (maxPerDay > 0 && Number(st.proactiveCountToday || 0) >= maxPerDay) {
+        log(`[reserved2] 主动机会跳过 ${key}：今天已达上限 ${maxPerDay} 次`);
+        scheduleProactiveCheckV2(key);
+        return;
+      }
+      // 每次接触只主动一次：她主动发过之后，如果一直没人接话，就不再追。
+      if (st.proactiveSentAt && st.proactiveSentAt > (st.lastIncomingAt || 0)) {
+        scheduleProactiveCheckV2(key);
+        return;
+      }
       const probBase = Number(p.probability);
       let prob = Math.min(1, Math.max(0, Number.isFinite(probBase) ? probBase : 0.4));
       const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
       if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
       if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
-      const hour = new Date().getHours();
-      if (hour >= 23 || hour < 8) prob *= 0.3;
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
       if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
+        st.proactiveWakePendingAt = Date.now();
+        saveSocialV2State();
         void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
       }
       scheduleProactiveCheckV2(key);
@@ -10564,11 +11539,33 @@ async function main() {
       return;
     }
 
-    // 静默模式：群友消息不投递给 agent（只记录）；管理员消息照常
-    if (roleState.mode === 'silent' && !isOwner) {
+    // 静默时段（工作日 09:00–12:00 / 14:00–18:00，UTC+8）：整条链路停摆；
+    // 只有「@ / 引用」这一种例外——静默期仅管理员，临时覆盖期任何人——且只放行这一条。
+    const atSelf = Array.isArray(event?.message)
+      && event.message.some((seg) => seg?.type === 'at' && String(seg?.data?.qq) === String(event?.self_id ?? ''));
+    const quietStateNow = quietHours.state().state;
+    if (quietStateNow !== 'normal') {
+      // 私聊没有 @ 可言：管理员私聊本身就等于直接叫他（Q2）。
+      const mentioned = atSelf || quoteTargetIsSelf || (kind === 'private' && isOwner);
+      if (!quietHours.allowsInbound({ isOwner, mentioned })) {
+        quietHours.noteSuppressed();
+        appendActivity(`${key}（${quietStateNow === 'override' ? '临时覆盖' : '静默时段'}）忽略 ${event.user_id}：${textContent.slice(0, 60)}`);
+        log(`[quiet] ${quietStateNow} 忽略消息 ${key}（来自 ${event.user_id}，@=${atSelf}）`);
+        return;
+      }
+      quietHours.markOwnerException(key);
+      log(`[quiet] ${quietStateNow} 例外放行 ${key}（${isOwner ? '管理员' : '群友'} @/引用），回完即停`);
+    } else if (roleState.mode === 'silent' && !isOwner) {
+      // 手动静默（控制台开关）：群友消息不投递给 agent（只记录）；管理员消息照常
       appendActivity(`${key}（静默模式）群友 ${event.user_id}：${textContent.slice(0, 80)}`);
       log(`静默模式，忽略群友消息 ${key}`);
       return;
+    }
+
+    // 显式「用语音说」的请求：给这一轮唤醒带一次性提示，让模型优先用 qq_tts_say。
+    if ((isOwner || atSelf || quoteTargetIsSelf) && /语音|说句话|说一句|读一下|念一下|用声音|发条语音/.test(plainContent)) {
+      voiceRequests.set(key, Date.now());
+      log(`[tts] ${key} 收到语音请求（来自 ${event.user_id}）`);
     }
 
     // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接拦截
@@ -11581,6 +12578,7 @@ async function main() {
     // 用实际连接地址（自愈后可能与 config 里的初值不同，别打印过期的那个）
     const connectedUrl = bot.url ?? cfg.snowluma.wsUrl;
     snowlumaHealth.connected = true;
+    snowlumaHealth.connectedAt = Date.now();
     log(`SnowLuma 已连接：${connectedUrl}`);
     // 「已连接」只说明与 SnowLuma 的 WebSocket 通了，**不说明 QQ 侧收得到消息** ——
     // 这个区别见 startSnowlumaWatch 的说明。这里顺手把上游健康快照刷一次。
@@ -11732,6 +12730,8 @@ async function main() {
   }
   startDshWatch();
   startSnowlumaWatch();
+  // 静默时段：每分钟对一次状态；进入静默就清掉所有自主定时器，退出后再排回去。
+  startQuietTicker();
   startConsoleServer();
 
   await pumpMux();

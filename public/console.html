@@ -680,23 +680,20 @@ pre {
 #section-silent {
   grid-column:1/-1;
   order:2;
-  display:grid;
-  grid-template-columns:1fr auto;
-  gap:8px 20px;
   padding-top:20px;
   padding-bottom:20px
 }
 #section-silent h2 {
-  margin:0;
-  align-self:center
+  margin:0 0 10px
 }
 #section-silent .meta {
-  grid-column:1/-1;
-  margin:0
+  margin:0 0 6px
 }
 #section-silent .row {
-  grid-column:2;
-  grid-row:1
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin:8px 0 0
 }
 .tag {
   display:inline-block;
@@ -1868,10 +1865,12 @@ button:active:not(:disabled) {
         <summary>切换当前启用的人格</summary>
         <div class="settings-content">
           <div class="row" style="margin-top:10px">
-            <input type="text" id="roleInput" placeholder="选择已有角色或输入新角色名">
+            <select id="roleInput" style="flex:1 1 200px"></select>
             <button id="roleSet">设置</button>
             <button id="roleClear">清除</button>
           </div>
+          <div class="meta" id="roleVoiceHint">当前音色：加载中…</div>
+          <div class="meta">切换人格会一并换掉 TTS 音色、注音字典和唤醒别名（取自 <code>roles/&lt;角色&gt;.pack.json</code>）。</div>
           <div class="meta">清空当前人格后，AI 只按「仿真提示词」行动，不扮演任何角色。</div>
         </div>
       </details>
@@ -2172,19 +2171,7 @@ button:active:not(:disabled) {
       </div>
 
       </div></details>
-<details class="settings-group"><summary>主动机会参数（proactive：群安静时 AI 主动冒泡）</summary><div class="settings-content">
-      <div class="row">
-        <label style="flex:1">启用主动机会</label><input type="checkbox" id="v2ProactiveEnabled" style="width:auto">
-        <label style="flex:1">检查间隔（分）</label>
-        <input type="number" id="v2ProactiveIntervalMin" min="1" style="width:80px"> ~
-        <input type="number" id="v2ProactiveIntervalMax" min="1" style="width:80px">
-      </div>
-      <div class="row">
-        <label style="flex:1">安静阈值（分）</label><input type="number" id="v2ProactiveIdleThreshold" min="1" style="width:80px">
-        <label style="flex:1">触发概率</label><input type="number" id="v2ProactiveProbability" step="0.05" min="0" max="1" style="width:80px">
-      </div>
-
-      </div></details>
+<!-- 主动机会参数已移到「运行总览 → 主动搭话」卡片，这里不再重复设置，避免两个入口改同一批参数。 -->
 <details class="settings-group"><summary>表情包参数（sticker：QQ 收藏表情体系）</summary><div class="settings-content">
       <div class="row">
         <label style="flex:1">启用表情包体系</label><input type="checkbox" id="v2StickerEnabled" style="width:auto">
@@ -2454,24 +2441,113 @@ button:active:not(:disabled) {
       </div>
     </section>
 <section id="section-silent" data-page="overview" class="card">
-      <h2>静默开关</h2>
-      <div class="row">
+      <h2>静默</h2>
+      <div class="meta" id="quietStatusLine">状态加载中…</div>
+      <div class="row" style="margin-top:8px">
         <button id="silentOn">开启静默</button>
         <button id="silentOff">恢复正常</button>
       </div>
-      <div class="meta">静默时群友消息不投递 agent，仅管理员可对话。</div>
+      <div class="row" style="margin-top:8px">
+        <button id="quietResume15">临时恢复 15 分钟</button>
+        <button id="quietSkipWindow">跳过本窗口</button>
+        <button id="quietSkipDay">今天不再静默</button>
+        <button id="quietClearOverride">取消覆盖</button>
+      </div>
+      <div class="meta" id="quietRuleLine">工作日 09:00–12:00 / 14:00–18:00（UTC+8），周末与法定节假日全天正常；静默期只有 @ 或引用会回应，回完即停。</div>
+      <div class="meta" id="quietMsg"></div>
+    </section>
+<section id="section-tts" data-page="overview" class="card span-all">
+      <h2 data-note="保存后立即生效">语音（Fish Audio）</h2>
+      <div class="row">
+        <label style="flex:0 0 auto">启用 AI 发语音</label>
+        <input type="checkbox" id="ttsEnabled" style="width:auto">
+        <span class="meta" id="ttsStatus" style="margin:0 0 0 auto">—</span>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 80px">Base URL</label>
+        <input id="ttsBaseUrl" type="text" style="flex:1 1 260px" placeholder="https://api.fish.audio">
+        <label style="flex:0 0 auto">模型</label>
+        <select id="ttsModel" style="flex:0 1 180px"></select>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 80px">API Key</label>
+        <input id="ttsApiKey" type="password" autocomplete="new-password" style="flex:1 1 260px" placeholder="留空表示不修改">
+        <span class="meta" id="ttsKeyState" style="margin:0"></span>
+        <button id="ttsSave">保存</button>
+        <span class="meta" id="ttsMsg" style="margin:0"></span>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 80px">音色 ID</label>
+        <input id="ttsVoiceId" type="text" style="flex:1 1 260px">
+        <button id="ttsTest">测试连通性</button>
+        <span class="meta" id="ttsTestMsg" style="margin:0"></span>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 80px">代理</label>
+        <input id="ttsProxy" type="text" style="flex:1 1 260px" placeholder="留空 = 直连；例如 http://127.0.0.1:7897">
+        <span class="meta" style="margin:0">只作用于 TTS 请求，不影响桥接其它出站</span>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 80px">试听</label>
+        <input id="ttsPreviewText" type="text" style="flex:1 1 240px" placeholder="日语，例：どうもですー。今日もお疲れさまですー。">
+        <select id="ttsPreviewTarget" style="flex:0 1 210px"></select>
+        <button id="ttsPreview">试听并发送</button>
+      </div>
+      <div class="meta" id="ttsHint">只念日语；发完语音会紧接着发文字版「日语 + 中文字幕」。</div>
     </section>
 <section id="section-dsh" data-page="overview" class="card span-all">
-      <h2 data-note="下一条消息生效">DSH 模型与思考强度</h2>
-      <div class="meta">模型：<span id="dshModelText">-</span> ｜ 提供方：<span id="dshProviderText">-</span></div>
-      <div class="row" style="margin-top:10px">
+      <h2 data-note="默认跟随 DSH 全局默认">DSH 模型与思考强度</h2>
+      <div class="meta">模型：<span id="dshModelText">-</span> ｜ 提供方：<span id="dshProviderText">-</span> ｜ 思考强度：<span id="dshEffortText">-</span></div>
+      <div class="meta" id="dshSourceNote"></div>
+      <div class="meta" id="dshUsageNote"></div>
+      <div class="row" id="dshEffortRow" style="margin-top:10px">
         <label style="flex:0 0 auto">思考强度</label>
         <select id="dshEffortSelect" style="flex:0 1 220px"></select>
         <button id="dshEffortSave">保存</button>
         <span class="meta" id="dshEffortMsg"></span>
       </div>
       <div class="meta" id="dshEffortNote"></div>
-      <div class="meta" id="dshEffortSideEffect"></div>
+    </section>
+<section id="section-proactive" data-page="overview" class="card span-all">
+      <h2 data-note="保存后立即生效">主动搭话</h2>
+      <div class="row">
+        <label style="flex:0 0 auto">启用主动搭话</label>
+        <input type="checkbox" id="pcEnabled" style="width:auto">
+        <label style="flex:0 0 auto;margin-left:18px">群聊</label>
+        <input type="checkbox" id="pcGroup" style="width:auto">
+        <label style="flex:0 0 auto;margin-left:18px">私聊</label>
+        <input type="checkbox" id="pcPrivate" style="width:auto">
+        <span class="meta" id="pcStatus" style="margin:0 0 0 auto">—</span>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 110px">检查间隔（分）</label>
+        <input type="number" id="pcIntervalMin" min="1" style="width:78px">
+        <span class="meta" style="margin:0 4px">~</span>
+        <input type="number" id="pcIntervalMax" min="1" style="width:78px">
+        <label style="flex:0 0 100px;margin-left:14px">安静阈值（分）</label>
+        <input type="number" id="pcIdle" min="1" style="width:78px">
+      </div>
+      <div class="row">
+        <label style="flex:0 0 110px">触发概率</label>
+        <input type="number" id="pcProb" step="0.05" min="0" max="1" style="width:78px">
+        <label style="flex:0 0 80px;margin-left:14px">每天最多</label>
+        <input type="number" id="pcMaxPerDay" min="0" style="width:70px">
+        <span class="meta" style="margin:0 4px">次（0 = 不限）</span>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 110px">夜间禁止</label>
+        <input type="text" id="pcNightFrom" style="width:78px" placeholder="23:30">
+        <span class="meta" style="margin:0 4px">—</span>
+        <input type="text" id="pcNightTo" style="width:78px" placeholder="07:00">
+        <label style="flex:0 0 90px;margin-left:14px">活跃窗口</label>
+        <input type="number" id="pcWindowDays" min="0" style="width:70px">
+        <span class="meta" style="margin:0 4px">天（0 = 不限）</span>
+      </div>
+      <div class="row">
+        <button id="pcSave">保存</button>
+        <span class="meta" id="pcMsg" style="margin:0"></span>
+      </div>
+      <div class="meta" id="pcHint">群聊：群里安静时她自己开口；私聊：她主动私聊戳你（默认关）。主动发过一次后，等有人回应才会再主动；夜间窗口内不冒泡，直接排到窗口结束后。</div>
     </section>
 <section id="section-security" data-page="access" class="card">
       <h2>安全拦截通知</h2>
@@ -2831,6 +2907,32 @@ function resetRoleForm() {
   setRoleMsg('');
 }
 
+let roleVoiceCache = '';
+let roleWorldCache = null;
+
+function renderRoleHint() {
+  const el = document.getElementById('roleVoiceHint');
+  if (!el) return;
+  const voice = roleVoiceCache ? `当前音色：…${roleVoiceCache.slice(-8)}` : '当前音色：未配置';
+  const world = roleWorldCache
+    ? (roleWorldCache.songs || roleWorldCache.lives
+      ? `世界观 ${roleWorldCache.chars} 字（${roleWorldCache.songs} 首 / ${roleWorldCache.lives} 场）`
+      : `世界观 ${roleWorldCache.chars} 字（不是偶像：没有歌和舞台）`)
+    : '世界观：未配置（该角色没有配 worldName，或资料里没有他/她）';
+  el.textContent = `${voice} · ${world}（切换人格时会一起换）`;
+}
+
+async function loadRoleVoiceHint() {
+  if (!document.getElementById('roleVoiceHint')) return;
+  try {
+    const t = await api('/api/tts/config');
+    roleVoiceCache = String(t.voiceId || '');
+  } catch {
+    roleVoiceCache = '';
+  }
+  renderRoleHint();
+}
+
 async function refreshRoles() {
   try {
     const r = await api('/api/roles');
@@ -2840,6 +2942,31 @@ async function refreshRoles() {
       if (input && document.activeElement !== input) input.value = String(roleInjectMax);
     }
     const names = Array.isArray(r.roles) ? r.roles : [];
+    roleWorldCache = r.world ?? null;
+    renderRoleHint();
+    // 角色下拉：列出全部角色；切换会连带换音色/注音字典/唤醒别名。
+    const picker = document.getElementById('roleInput');
+    if (picker && picker.tagName === 'SELECT') {
+      const current = String(r.current ?? '');
+      picker.replaceChildren();
+      const blank = document.createElement('option');
+      blank.value = '';
+      blank.textContent = '（不扮演角色）';
+      picker.appendChild(blank);
+      for (const name of names) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        picker.appendChild(opt);
+      }
+      if (current && !names.includes(current)) {
+        const extra = document.createElement('option');
+        extra.value = current;
+        extra.textContent = current;
+        picker.appendChild(extra);
+      }
+      picker.value = current;
+    }
     roleCache = Array.isArray(r.summaries) && r.summaries.length === names.length
       ? r.summaries
       : names.map((name) => ({ name, chars: 0, bytes: 0, excerpt: '', truncated: false }));
@@ -2950,8 +3077,12 @@ async function refreshSimPrompt() {
 async function refreshDshModel() {
   try {
     const r = await api('/api/dsh/model');
+    const follow = r.followDsh !== false;
     document.getElementById('dshModelText').textContent = r.model || '-';
     document.getElementById('dshProviderText').textContent = r.provider || '-';
+    document.getElementById('dshEffortText').textContent = r.reasoningEffort || (follow ? '模型默认' : '-');
+    // 跟随模式下控制台改强度会被后端 400 拒绝：整行收起来，别让人点了没反应还不知道为什么
+    document.getElementById('dshEffortRow').style.display = follow ? 'none' : '';
     const select = document.getElementById('dshEffortSelect');
     const labels = r.labels || {};
     select.replaceChildren();
@@ -2959,24 +3090,103 @@ async function refreshDshModel() {
       const el = document.createElement('option');
       el.value = option;
       const info = labels[option] || {};
-      const isDefault = option === (r.providerDefault || r.default);
+      // providerDefault 为空说明 catalog 没给这个模型标默认档，别拿 `default`（兜底值）冒充默认
+      const isDefault = !!r.providerDefault && option === r.providerDefault;
       el.textContent = `${option}${isDefault ? '（默认）' : ''}`;
       if (info.description) el.title = info.description;
       select.appendChild(el);
     }
     select.value = r.reasoningEffort;
     const parts = [];
-    if (r.providerDefault) parts.push(`DSH 出厂默认是 ${r.providerDefault}`);
+    if (follow) {
+      parts.push(r.dshDefault
+        ? `跟随 DSH 全局默认（profile ${r.dshDefault.profile} 的 agent-default-model）`
+        : '跟随 DSH：当前读不到 DSH 的全局默认配置，桥接不会主动设置会话模型，实际由 DSH 决定（上面显示的模型仅供参考）');
+      parts.push('要改模型或强度请在 DSH 的 Web GUI 设置里改，改完下一条消息生效');
+    } else {
+      parts.push('覆盖模式：使用 config.json 的 dsh.provider / model / reasoningEffort（dsh.manageModel=true）');
+      if (r.dshDefault) parts.push(`DSH 全局默认是 ${r.dshDefault.provider} / ${r.dshDefault.model}`);
+    }
+    if (r.providerDefault) parts.push(`该模型厂商默认档位 ${r.providerDefault}`);
     parts.push(r.catalogSource === 'dsh' ? '档位取自 DSH 实际公布的能力' : '未能读取 DSH 能力，档位为内置清单');
     document.getElementById('dshEffortNote').textContent = parts.join('；') + '。';
-    document.getElementById('dshEffortSideEffect').textContent = r.globalSideEffect
-      ? '注意：切换会同时写入 DSH 的全局默认（~/.dsh/settings.yaml 的 agent-default-model），也就是 Web GUI 里新建会话的默认强度也会跟着变。'
+    // 只有覆盖模式才有「连 DSH 全局默认一起改掉」的副作用
+    document.getElementById('dshSourceNote').textContent = r.globalSideEffect
+      ? '注意：覆盖模式会把桥接的值推到 DSH 的全局默认上，Web GUI 里新建会话也会跟着变。'
       : '';
+    const usage = r.lastUsage;
+    document.getElementById('dshUsageNote').textContent = usage
+      ? `实际用量归属：${usage.provider} / ${usage.model}${usage.at ? '（最近一次 ' + new Date(usage.at).toLocaleString('zh-CN', { hour12: false }) + '）' : ''}`
+      : '实际用量归属：暂无记录（还没有产生过调用）';
     document.getElementById('dshEffortMsg').textContent = '';
   } catch (error) {
     document.getElementById('dshEffortMsg').textContent = '读取失败：' + (error?.message ?? error);
   }
 }
+
+// ── 主动搭话卡片 ─────────────────────────────────────────────────────────────
+function setProactiveStatus(pa) {
+  const el = document.getElementById('pcStatus');
+  if (!el) return;
+  if (!pa || pa.enabled === false) { el.textContent = '已关闭'; return; }
+  const where = [];
+  if (pa.group !== false) where.push('群聊');
+  if (pa.private === true) where.push('私聊');
+  el.textContent = where.length ? '已开启：' + where.join(' + ') : '已开启，但群聊和私聊都是关的';
+}
+
+async function loadProactiveCard() {
+  try {
+    const r = await api('/api/socialV2/config');
+    const pa = (r && r.config && r.config.proactive) || {};
+    document.getElementById('pcEnabled').checked = pa.enabled !== false;
+    document.getElementById('pcGroup').checked = pa.group !== false;
+    document.getElementById('pcPrivate').checked = pa.private === true;
+    document.getElementById('pcIntervalMin').value = Math.round((pa.checkIntervalMinMs || 1800000) / 60000);
+    document.getElementById('pcIntervalMax').value = Math.round((pa.checkIntervalMaxMs || 5400000) / 60000);
+    document.getElementById('pcIdle').value = Math.round((pa.idleThresholdMs || 900000) / 60000);
+    document.getElementById('pcProb').value = pa.probability ?? 0.3;
+    document.getElementById('pcMaxPerDay').value = pa.maxPerDay ?? 4;
+    document.getElementById('pcNightFrom').value = pa.nightFrom ?? '23:30';
+    document.getElementById('pcNightTo').value = pa.nightTo ?? '07:00';
+    document.getElementById('pcWindowDays').value = pa.windowDays ?? 7;
+    setProactiveStatus(pa);
+    document.getElementById('pcMsg').textContent = '';
+  } catch (error) {
+    document.getElementById('pcMsg').textContent = '读取失败：' + (error?.message ?? error);
+  }
+}
+
+async function saveProactiveCard() {
+  const msg = document.getElementById('pcMsg');
+  const num = (id, dflt) => {
+    const v = Number(document.getElementById(id).value);
+    return Number.isFinite(v) ? v : dflt;
+  };
+  const proactive = {
+    enabled: document.getElementById('pcEnabled').checked,
+    group: document.getElementById('pcGroup').checked,
+    private: document.getElementById('pcPrivate').checked,
+    checkIntervalMinMs: Math.max(1, num('pcIntervalMin', 30)) * 60000,
+    checkIntervalMaxMs: Math.max(1, num('pcIntervalMax', 90)) * 60000,
+    idleThresholdMs: Math.max(1, num('pcIdle', 15)) * 60000,
+    probability: Math.min(1, Math.max(0, num('pcProb', 0.3))),
+    maxPerDay: Math.max(0, Math.round(num('pcMaxPerDay', 4))),
+    nightFrom: document.getElementById('pcNightFrom').value.trim() || '23:30',
+    nightTo: document.getElementById('pcNightTo').value.trim() || '07:00',
+    windowDays: Math.max(0, Math.round(num('pcWindowDays', 7)))
+  };
+  if (msg) msg.textContent = '保存中…';
+  try {
+    await api('/api/socialV2/config', 'POST', { proactive });
+    if (msg) msg.textContent = '已保存（下一轮检查开始生效）';
+    setProactiveStatus(proactive);
+  } catch (error) {
+    if (msg) msg.textContent = '保存失败：' + (error?.message ?? error);
+  }
+}
+
+document.getElementById('pcSave')?.addEventListener('click', saveProactiveCard);
 
 async function refreshWhitelist() {
   try {
@@ -3043,9 +3253,11 @@ document.getElementById('closedPreset').addEventListener('change', async () => {
 });
 document.getElementById('roleSet').addEventListener('click', async () => {
   const r = await api('/api/role', 'POST', { role: document.getElementById('roleInput').value.trim() });
-  if (r.ok) refreshRoles(); else alert(r.error || '设置失败');
+  // 音色跟着角色走：语音卡那一栏必须一起刷新，否则它还显示上一个角色的音色，
+  // 看着像"切了没换"，一点保存还会把旧音色写进新角色包。
+  if (r.ok) { refreshRoles(); loadRoleVoiceHint(); loadTtsConfig(true); } else alert(r.error || '设置失败');
 });
-document.getElementById('roleClear').addEventListener('click', async () => { await api('/api/role', 'POST', { role: null }); refreshRoles(); refresh(); });
+document.getElementById('roleClear').addEventListener('click', async () => { await api('/api/role', 'POST', { role: null }); refreshRoles(); loadRoleVoiceHint(); loadTtsConfig(true); refresh(); });
 document.getElementById('roleCreate').addEventListener('click', async () => {
   const name = document.getElementById('newRoleName').value.trim();
   const content = document.getElementById('newRoleContent').value.trim();
@@ -3154,6 +3366,79 @@ document.getElementById('dshEffortSave').addEventListener('click', async () => {
 });
 document.getElementById('silentOn').addEventListener('click', async () => { await api('/api/role-mode', 'POST', { mode: 'silent' }); refresh(); });
 document.getElementById('silentOff').addEventListener('click', async () => { await api('/api/role-mode', 'POST', { mode: 'active' }); refresh(); });
+const quietOverride = async (kind) => {
+  await api('/api/quiet-hours/override', 'POST', { kind });
+  const msg = document.getElementById('quietMsg');
+  if (msg) msg.textContent = '已设置临时覆盖（' + new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '）';
+  refresh();
+};
+document.getElementById('quietResume15').addEventListener('click', () => quietOverride('minutes'));
+document.getElementById('quietSkipWindow').addEventListener('click', () => quietOverride('window'));
+document.getElementById('quietSkipDay').addEventListener('click', () => quietOverride('day'));
+document.getElementById('quietClearOverride').addEventListener('click', async () => {
+  await api('/api/quiet-hours/clear', 'POST', {});
+  const msg = document.getElementById('quietMsg');
+  if (msg) msg.textContent = '已取消覆盖';
+  refresh();
+});
+document.getElementById('ttsSave').addEventListener('click', async () => {
+  const msg = document.getElementById('ttsMsg');
+  const payload = {
+    enabled: document.getElementById('ttsEnabled').checked,
+    baseUrl: document.getElementById('ttsBaseUrl').value.trim(),
+    model: document.getElementById('ttsModel').value,
+    voiceId: document.getElementById('ttsVoiceId').value.trim(),
+    proxy: document.getElementById('ttsProxy').value.trim()
+  };
+  const key = document.getElementById('ttsApiKey').value.trim();
+  if (key) payload.apiKey = key;
+  if (msg) msg.textContent = '保存中…';
+  try {
+    const r = await api('/api/tts/config', 'POST', payload);
+    document.getElementById('ttsApiKey').value = '';
+    if (msg) msg.textContent = r && r.ok ? '已保存' : ('保存失败：' + ((r && r.error) || '未知错误'));
+    await loadTtsConfig(true);
+  } catch (error) {
+    if (msg) msg.textContent = '保存失败：' + (error?.message ?? error);
+  }
+});
+document.getElementById('ttsPreview').addEventListener('click', async () => {
+  const msg = document.getElementById('ttsMsg');
+  const btn = document.getElementById('ttsPreview');
+  const text = document.getElementById('ttsPreviewText').value.trim();
+  const target = document.getElementById('ttsPreviewTarget').value;
+  if (!text) { if (msg) msg.textContent = '先写一句试听文本'; return; }
+  btn.disabled = true;
+  if (msg) msg.textContent = '合成中…';
+  try {
+    const r = await api('/api/tts/preview', 'POST', { target, text });
+    if (msg) msg.textContent = r && r.ok
+      ? ('已发送：' + r.seconds + ' 秒（' + r.source + '）')
+      : ('失败：' + ((r && r.error) || '未知错误'));
+  } catch (error) {
+    if (msg) msg.textContent = '失败：' + (error?.message ?? error);
+  } finally {
+    btn.disabled = false;
+  }
+});
+document.getElementById('ttsTest').addEventListener('click', async () => {
+  const msg = document.getElementById('ttsTestMsg');
+  const btn = document.getElementById('ttsTest');
+  btn.disabled = true;
+  if (msg) msg.textContent = '测试中…';
+  try {
+    const r = await api('/api/tts/test', 'POST', {});
+    if (msg) {
+      msg.textContent = r && r.ok
+        ? ('连通 · ' + r.ms + 'ms · ' + r.seconds + ' 秒音频')
+        : ('失败：' + ((r && r.code) || '') + ' ' + ((r && r.error) || ''));
+    }
+  } catch (error) {
+    if (msg) msg.textContent = '失败：' + (error?.message ?? error);
+  } finally {
+    btn.disabled = false;
+  }
+});
 document.getElementById('wlSave').addEventListener('click', async () => {
   const parse = (s) => s.split(/[,，\s]+/).map(x => x.trim()).filter(Boolean).map(Number).filter(Number.isFinite);
   const r = await api('/api/whitelist', 'POST', {
@@ -3317,11 +3602,7 @@ async function loadV2Config() {
     document.getElementById('v2MinQuietAfterNewMs').value = wt.minQuietAfterNewMs ?? 10000;
     document.getElementById('v2AutoReplyCheckSec').value = Math.round((c.autoReplyCheckMs || 30000) / 1000);
     const pa = c.proactive || {};
-    document.getElementById('v2ProactiveEnabled').checked = pa.enabled !== false;
-    document.getElementById('v2ProactiveIntervalMin').value = Math.round((pa.checkIntervalMinMs || 1800000) / 60000);
-    document.getElementById('v2ProactiveIntervalMax').value = Math.round((pa.checkIntervalMaxMs || 5400000) / 60000);
-    document.getElementById('v2ProactiveIdleThreshold').value = Math.round((pa.idleThresholdMs || 900000) / 60000);
-    document.getElementById('v2ProactiveProbability').value = pa.probability ?? 0.3;
+    // 主动机会参数的 UI 已迁到运行总览卡片（pc* 元素由 loadProactiveCard 负责）。
     const stk = c.sticker || {};
     document.getElementById('v2StickerEnabled').checked = stk.enabled !== false;
     document.getElementById('v2StickerSyncTtlSec').value = Math.round((stk.syncTtlMs || 60000) / 1000);
@@ -3397,13 +3678,7 @@ async function saveV2Config() {
       defaultQuietMs: Number.isFinite(Number(document.getElementById('v2WaitDefaultQuietMs').value)) ? Math.max(0, Math.round(Number(document.getElementById('v2WaitDefaultQuietMs').value))) : 8000,
       minQuietAfterNewMs: Number.isFinite(Number(document.getElementById('v2MinQuietAfterNewMs').value)) ? Math.max(0, Math.round(Number(document.getElementById('v2MinQuietAfterNewMs').value))) : 10000
     },
-    proactive: {
-      enabled: document.getElementById('v2ProactiveEnabled').checked,
-      checkIntervalMinMs: Math.round(Number(document.getElementById('v2ProactiveIntervalMin').value) || 30) * 60000,
-      checkIntervalMaxMs: Math.round(Number(document.getElementById('v2ProactiveIntervalMax').value) || 90) * 60000,
-      idleThresholdMs: Math.round(Number(document.getElementById('v2ProactiveIdleThreshold').value) || 15) * 60000,
-      probability: Number(document.getElementById('v2ProactiveProbability').value) || 0
-    },
+    // proactive 由运行总览的「主动搭话」卡片单独保存（saveProactiveCard），这里不再提交，避免互相覆盖。
     sticker: {
       enabled: document.getElementById('v2StickerEnabled').checked,
       syncTtlMs: Math.max(1000, Math.round(Number(document.getElementById('v2StickerSyncTtlSec').value) || 60) * 1000),
@@ -4498,6 +4773,73 @@ function updateOverview(status, modeLabel) {
     button.classList.toggle('active', active);
     button.setAttribute('aria-pressed', String(active));
   }
+  renderQuiet(status);
+  renderTtsTargets(status);
+}
+// ── 语音（TTS）──────────────────────────────────────────────────────────────
+let ttsLoaded = false;
+function renderTtsTargets(status) {
+  const sel = document.getElementById('ttsPreviewTarget');
+  if (!sel || sel.dataset.filled === '1') return;
+  const opts = [];
+  if (status.ownerQQ) opts.push({ v: 'private:' + status.ownerQQ, t: '私聊 ' + status.ownerQQ + '（你）' });
+  for (const g of (status.allowGroups || [])) opts.push({ v: 'group:' + g, t: '群 ' + g });
+  if (!opts.length) return;
+  sel.innerHTML = opts.map((o) => '<option value="' + o.v + '">' + o.t + '</option>').join('');
+  sel.dataset.filled = '1';
+  void loadTtsConfig();
+}
+async function loadTtsConfig(force = false) {
+  if (ttsLoaded && !force) return;
+  try {
+    const c = await api('/api/tts/config');
+    ttsLoaded = true;
+    document.getElementById('ttsEnabled').checked = c.enabled === true;
+    document.getElementById('ttsBaseUrl').value = c.baseUrl || '';
+    document.getElementById('ttsVoiceId').value = c.voiceId || '';
+    document.getElementById('ttsProxy').value = c.proxy || '';
+    const modelSel = document.getElementById('ttsModel');
+    modelSel.innerHTML = (c.models || []).map((m) => '<option value="' + m + '">' + m + '</option>').join('');
+    modelSel.value = c.model || 's2.1-pro-free';
+    document.getElementById('ttsKeyState').textContent = c.keyFromEnv
+      ? '环境变量已设置（优先）'
+      : (c.hasKey ? '已配置 ' + (c.keyMask || '') : '未配置');
+    document.getElementById('ttsStatus').textContent = (c.enabled ? '已启用' : '未启用')
+      + ' · ' + (c.model || '') + ' · 上限 ' + c.maxSeconds + ' 秒 · '
+      + c.maxPerMinute + ' 条/分、' + c.maxPerHour + ' 条/时';
+    document.getElementById('ttsHint').textContent = '只念日语；发完语音会紧接着发文字版「日语 + 中文字幕」。'
+      + '超过 ' + c.maxSeconds + ' 秒或合成失败时只发文字。';
+  } catch (error) {
+    const msg = document.getElementById('ttsMsg');
+    if (msg) msg.textContent = '读取配置失败：' + (error?.message ?? error);
+  }
+}
+function renderQuiet(status) {
+  const q = status && status.quietHours;
+  const line = document.getElementById('quietStatusLine');
+  if (!line) return;
+  if (!q) { line.textContent = '状态不可用'; return; }
+  const manualSilent = status.roleMode === 'silent';
+  const untilText = (ts) => {
+    if (!ts) return '';
+    const at = new Date(Number(ts)).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+    const mins = Math.max(0, Math.round((Number(ts) - Date.now()) / 60000));
+    return `（到 ${at}，约 ${mins} 分钟）`;
+  };
+  const stateText = {
+    normal: '正常：全部行为放开',
+    quiet: '静默中（时间段）：只有管理员 @ 或引用会回应，回完即停',
+    override: '临时恢复（被动）：任何人 @ 才回，不主动',
+  }[q.state] || q.state;
+  const manualText = manualSilent ? ' ｜ 手动静默已开启（群友消息一律不投递）' : '';
+  line.textContent = stateText + (q.until ? ' ' + untilText(q.until) : '') + manualText;
+  const clearButton = document.getElementById('quietClearOverride');
+  if (clearButton) clearButton.disabled = q.state !== 'override';
+  const rule = document.getElementById('quietRuleLine');
+  if (rule) {
+    const windows = (q.windows || []).map((w) => w.join('–')).join('、');
+    rule.textContent = `工作日 ${windows}（UTC+8）· 周末与法定节假日全天正常${q.holiday ? '（今天：' + q.holiday + '）' : ''} · 例外：@ 或引用时回应，回完即停`;
+  }
 }
 function setConnectionError(error) {
   document.getElementById('statusText').className = 'status-badge offline';
@@ -5047,7 +5389,7 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
+refresh(); refreshRoles(); loadRoleVoiceHint(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); loadProactiveCard(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
 setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 3000);
 // 用量看板只在本页可见时轮询：既保证「实时」，又不让其它页白白多打两份接口。
 setInterval(() => { if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);

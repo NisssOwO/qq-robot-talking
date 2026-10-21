@@ -144,6 +144,7 @@
     },
     "wake": {
       "defaultMode": "diving",
+    "aliases": [],
       "preSleepWaitEnabled": true,
       "preSleepWaitMs": 300000,
       "recommendedDefaultInfinite": true,
@@ -220,7 +221,7 @@
     "voice": {
       "enabled": false,
       "dir": "audio",
-      "maxSeconds": 300,
+      "maxSeconds": 60,
       "maxBytes": 20971520,
       "maxPerMinute": 2,
       "maxPerHour": 10,
@@ -257,7 +258,24 @@
       "maxCount": 5
     }
   },
-  "webSearch": {
+  "quietHours": {
+    "enabled": false,
+    "weekdays": [1, 2, 3, 4, 5],
+    "windows": [["09:00", "12:00"], ["14:00", "18:00"]],
+    "holidays": "cn"
+  },
+  "tts": {
+    "enabled": false,
+    "provider": "fish",
+    "baseUrl": "https://api.fish.audio",
+    "apiKey": "",
+    "model": "s2.1-pro-free",
+    "voiceId": "",
+    "timeoutMs": 30000,
+    "keepFiles": 20,
+    "proxy": "",
+    "dictionary": {}
+  },  "webSearch": {
     "provider": "auto",
     "apiKey": "",
     "apiKeyEnv": "DEEPSEEK_API_KEY",

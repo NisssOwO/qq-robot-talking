@@ -329,6 +329,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
   qq_list_voices: 'sendVoice',
+  qq_tts_say: 'ttsSay',
   // 下面这些曾经漏登记。漏一个不是"多注册一个工具"那么轻：桥接那边按 `v2ToolEnabled(flag)`
   // 在**调用期**一律 403，而这里不登记就等于"控制台显示已关闭、模型每次请求仍收到它的完整
   // 描述与参数 schema，然后调用它、再拿到 403"——既白烧 token（本文件开头 176 行起就是为省这份
@@ -1209,6 +1210,32 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `获取语音库失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.tts?.enabled === true && cfg.socialV2?.tools?.ttsSay !== false) {
+  server.tool(
+    'qq_tts_say',
+    '用自己的声音说一句话：把 ja 合成成日语语音发到当前会话，紧接着再发一条文字版「日语 + 中文字幕」。什么时候用：被要求说句话/读一下、道晚安、或一句很短的回应；平常闲聊不要每条都用。只念 ja，中文不念（中文只出现在随后那条文字里）。合成失败或超时不要重试第二次，直接改用 qq_send_message 发文字。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      ja: z.string().describe('要念出来的日语原文：只放日语台词，不要中文、括号旁白、Markdown 或 emoji'),
+      zh: z.string().describe('这段日语的中文字幕，与 ja 一一对应；会作为文字版的第二段发出')
+    },
+    async ({ key, token, ja, zh }) => {
+      try {
+        const data = await agentApi('/api/socialV2/tts-say', {
+          method: 'POST',
+          body: JSON.stringify({ key, ja: String(ja), zh: String(zh ?? ''), token }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发语音失败：${error?.message ?? error}。请改用 qq_send_message 发文字，不要重试。` }], isError: true };
       }
     }
   );
