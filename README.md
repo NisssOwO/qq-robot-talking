@@ -242,6 +242,22 @@ npm start                  # 前台运行
 切换角色（控制台下拉或 `POST /api/role`）时，音色、注音字典、唤醒别名、世界观一起换。
 `worldName` 对应的角色必须在 `world.json` 的 `idols` 或 `office.staff` 里，否则不注入世界观。
 
+## 素材从哪儿来（角色卡 / 世界观 / 音色）
+
+本仓库**不带**任何角色素材。如果你的目标角色来自 [eidolon-sc](https://github.com/Sallyn0225/eidolon-sc)，它的 `characters/` 目录里基本都整理好了，可以直接对照着搬：
+
+| 你要的 | eidolon-sc 里的位置 | 搬到本项目 |
+| --- | --- | --- |
+| 角色人格卡 | `characters/sheets/<name>.md` | 按 `roles/README.md` 的分节结构改写（原文很长，压到 3000~5000 字符），存成 `roles/<角色名>.md` |
+| 角色资料（参考用，不注入） | `characters/facts/<name>.md` | `roles/.refs/<角色名>-资料.md` |
+| 世界观（事务所 / 组合 / 歌曲 / 演出） | `characters/world.json` | 直接复制到项目根目录的 `world.json` |
+| Fish Audio 音色 | `characters/characters.toml` 里的 `voice_id` | 角色包的 `voiceId` |
+| 注音字典 | `characters/readings.toml` 的 `phonemes` | 角色包的 `dictionary`（`{"写法": "音素"}`） |
+
+角色包的完整结构见上文「配置要点」里的 JSON 示例；本仓库不带任何具体角色的 pack，因为音色和名字属于个人配置。
+
+> **版权与许可**：eidolon-sc 的**代码与文档是 AGPL-3.0-or-later**，但**角色、设定、剧情、音色属于《偶像大师》版权方**，不是开源素材。请只在本地个人使用；**不要**把从 eidolon-sc 搬来的角色卡、`world.json`、facts、头像提交到本仓库或任何公开仓库——本仓库 `.gitignore` 已经排除这些文件，就是为了防止误提交。
+
 ## 目录结构（只列定制相关）
 
 ```
@@ -270,7 +286,7 @@ docs/UPSTREAM-README.md  # 上游完整 README（原文保留）
 
 - `config.json` 及所有备份 —— 含你的 QQ 号、群号、API Key
 - `state/`（会话、日志、令牌）、`audio/`（语音文件）
-- `world.json` —— 第三方世界观数据，自己放一份到项目根目录
+- `world.json` —— 世界观数据（从 eidolon-sc 拿的方法见上面「素材从哪儿来」），自己放一份到项目根目录
 - `roles/*.pack.json`、`roles/.refs/`、`roles/.backup/` —— 角色包与角色资料
 - `SnowLuma-*/` —— 网关二进制
 - 本机一键启动器 —— 含本机 QQ / DSH / SnowLuma 安装路径
