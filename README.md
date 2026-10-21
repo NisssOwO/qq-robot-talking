@@ -4,7 +4,7 @@
 
 这是 **[Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge) 的定制版**，基线 `v0.2.0-r4`。代码主体来自上游；本仓库在上游之上加了「静默时段 / Fish Audio 语音 / 角色包 / 世界观注入 / 主动搭话约束 / DSH 模型跟随」等能力。
 
-> 上游英文 README 原文见 [docs/UPSTREAM-README.en.md](docs/UPSTREAM-README.en.md)（未随定制同步，中文以本文件为准）。
+> 上游英文 README 原文见 [docs/UPSTREAM-README.en.md](docs/UPSTREAM-README.md)（未随定制同步，中文以本文件为准）。
 
 仓库历史刻意分成两段（[CHANGES.md](CHANGES.md) 有逐项说明）：
 
